@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import time
 from pathlib import Path
 
@@ -133,7 +134,7 @@ class EditorBridge:
 
     def __init__(self) -> None:
         self._session_conn: socket.socket | None = None
-        self._session_proc: object | None = None  # subprocess.Popen
+        self._session_proc: subprocess.Popen | None = None
 
     # ── Editor (stateless, per-call connection) ────────────────────────────
 
@@ -163,6 +164,7 @@ class EditorBridge:
                     return r
                 r = self._transact(conn, "get_ui", {"depth": depth})
                 if not r["ok"]:
+                    self._transact(conn, "unload", {})  # clean up even on failure
                     return r
                 tree = r["tree"]
                 self._transact(conn, "unload", {})
@@ -181,8 +183,6 @@ class EditorBridge:
         self, godot_bin: str, project_path: str, scene_path: str, timeout: int
     ) -> dict:
         """Launch game with --mcp flag, wait for RemoteControl to connect."""
-        import subprocess
-
         args = [godot_bin, "--path", project_path, "--", "--mcp"]
         if scene_path:
             args += ["--mcp-scene", scene_path]
