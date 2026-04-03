@@ -278,8 +278,18 @@ _bridge = EditorBridge()
 @mcp.tool()
 def inspect_ui_scene(path: str, depth: int = 1) -> str:
     """Load a Godot scene into the editor's SubViewport and return its UI node tree as JSON.
-    Stub — implemented in Task 2."""
-    raise NotImplementedError("inspect_ui_scene not yet implemented")
+    path is relative to the project root (e.g. 'scenes/hud.tscn').
+    depth controls how many levels of children to include; default 1 = top-level only.
+    Each call is a full load/unload cycle — any previously loaded scene is unloaded first.
+    Requires the Godot editor to be open with the project loaded.
+    Use this after editing a .tscn file or a script that populates UI in _ready."""
+    safe = safe_path(path)
+    if safe is None:
+        return "Error: path escapes project root"
+    result = _bridge.inspect_ui_scene_full(path, depth)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return json.dumps(result["tree"], indent=2)
 
 
 @mcp.tool()

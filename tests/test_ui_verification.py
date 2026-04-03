@@ -111,3 +111,47 @@ def test_end_session_safe_when_no_session():
     bridge = EditorBridge()
     result = bridge.end_session()
     assert result["ok"] is True
+
+
+# ── inspect_ui_scene tests ─────────────────────────────────────────────────────
+
+import server as srv
+
+
+def test_inspect_ui_scene_path_traversal(monkeypatch, tmp_path):
+    """Rejects paths that escape the project root."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    import importlib
+    importlib.reload(srv)
+    result = srv.inspect_ui_scene("../../etc/passwd")
+    assert result.startswith("Error: path escapes project root")
+
+
+def test_inspect_ui_scene_editor_not_running(monkeypatch, tmp_path):
+    """Returns error string when EditorBridge cannot connect."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    import importlib
+    importlib.reload(srv)
+    srv._bridge.EDITOR_PORT = 16005  # nothing listening
+    result = srv.inspect_ui_scene("scenes/menu.tscn")
+    assert "editor bridge not available" in result
+
+
+def test_inspect_ui_scene_returns_json_tree(monkeypatch, tmp_path):
+    """Returns JSON string of the UI tree on success."""
+    (tmp_path / "scenes").mkdir()
+    (tmp_path / "scenes" / "menu.tscn").touch()
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    import importlib
+    importlib.reload(srv)
+
+    tree = {"name": "Menu", "type": "Control", "children": []}
+    srv._bridge.inspect_ui_scene_full = MagicMock(
+        return_value={"ok": True, "tree": tree}
+    )
+    result = srv.inspect_ui_scene("scenes/menu.tscn", depth=2)
+    assert json.loads(result) == tree
+    srv._bridge.inspect_ui_scene_full.assert_called_once_with("scenes/menu.tscn", 2)
