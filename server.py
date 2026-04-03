@@ -19,17 +19,17 @@ def _require_env(name: str) -> str:
     return val
 
 
-def GODOT_BIN() -> str:  # noqa: N802
+def godot_bin() -> str:
     return _require_env("GODOT_BIN")
 
 
-def GODOT_PROJECT() -> str:  # noqa: N802
+def godot_project() -> str:
     return _require_env("GODOT_PROJECT")
 
 
 def safe_path(relative: str) -> Path | None:
     """Return resolved path if inside project root, None if path escapes."""
-    root = Path(GODOT_PROJECT()).resolve()
+    root = Path(godot_project()).resolve()
     target = (root / relative).resolve()
     return target if target.is_relative_to(root) else None
 
@@ -52,7 +52,7 @@ def scaffold_tests() -> str:
     smoke_runner.gd. Registers test runner autoloads in project.godot.
     Safe to run on a project that already has tests — never overwrites existing suite files.
     Returns a list of files created."""
-    project = GODOT_PROJECT()
+    project = godot_project()
     scaffold_src = Path(__file__).parent / "scaffold"
     created: list[str] = []
 
@@ -102,7 +102,7 @@ def check_scaffold() -> str:
     """Verify the GDScript test infrastructure is present and matches the expected
     SCAFFOLD_VERSION. Returns status (ok / missing / outdated), version found vs
     expected, and list of missing files if any."""
-    project = GODOT_PROJECT()
+    project = godot_project()
     missing: list[str] = []
 
     for rel in _SCAFFOLD_FILES:
@@ -150,7 +150,7 @@ def end_ui_session() -> str:
 
 
 @mcp.tool()
-def navigate_ui(action: str, params: dict = {}) -> str:
+def navigate_ui(action: str, params: dict | None = None) -> str:
     """Send a navigation or input command to the active UI session.
     Stub — implemented in Task 4."""
     raise NotImplementedError("navigate_ui not yet implemented")

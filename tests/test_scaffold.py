@@ -5,14 +5,16 @@ import importlib
 import server as srv
 
 
-def test_scaffold_tests_requires_scaffold_dir(tmp_path, monkeypatch):
-    """scaffold_tests() returns 'up to date' when no scaffold source files exist."""
+def test_scaffold_tests_creates_core_files(tmp_path, monkeypatch):
+    """scaffold_tests() copies base_test.gd, test_runner.gd, smoke_runner.gd."""
     monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
     monkeypatch.setenv("GODOT_BIN", "/bin/false")
     importlib.reload(srv)
-    # No scaffold/ dir in worktree yet — should not crash
     result = srv.scaffold_tests()
-    assert isinstance(result, str)
+    assert (tmp_path / "tests" / "base_test.gd").exists()
+    assert (tmp_path / "tests" / "test_runner.gd").exists()
+    assert (tmp_path / "tests" / "smoke" / "smoke_runner.gd").exists()
+    assert "base_test.gd" in result
 
 
 def test_check_scaffold_reports_missing(tmp_path, monkeypatch):
