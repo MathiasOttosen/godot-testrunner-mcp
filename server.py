@@ -4,6 +4,7 @@ import shutil
 import socket
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -306,7 +307,6 @@ class EditorBridge:
 
     @staticmethod
     def _default_screenshot_path(project_path: str) -> str:
-        from datetime import datetime
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         return str(Path(project_path) / "tests" / "ui_screenshots" / f"{ts}.png")
 
@@ -314,7 +314,7 @@ class EditorBridge:
 _bridge = EditorBridge()
 
 
-# ── Tools (stubs — filled in subsequent tasks) ─────────────────────────────────
+# ── Tools ──────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def inspect_ui_scene(path: str, depth: int = 1) -> str:
@@ -401,6 +401,10 @@ def screenshot_ui(save_path: str = "") -> str:
     If save_path is empty, saves to tests/ui_screenshots/<timestamp>.png in the project root.
     Uses the active game session if running; otherwise captures from the editor plugin's SubViewport.
     Call inspect_ui_scene or start_ui_session first."""
+    if save_path:
+        safe = safe_path(save_path)
+        if safe is None:
+            return "Error: path escapes project root"
     result = _bridge.screenshot(save_path, godot_project())
     if not result["ok"]:
         return f"Error: {result['error']}"

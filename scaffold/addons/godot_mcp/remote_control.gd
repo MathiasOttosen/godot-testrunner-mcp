@@ -10,6 +10,8 @@ var _peer: StreamPeerTCP
 
 
 func _ready() -> void:
+	# Use get_cmdline_user_args() not get_cmdline_args() — args after "--" are user args in Godot 4.
+	# The Python server passes "--mcp" after "--", so it only appears in user args.
 	var args := OS.get_cmdline_user_args()
 	if "--mcp" not in args:
 		return  # dormant in normal gameplay

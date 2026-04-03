@@ -113,6 +113,21 @@ def test_end_session_safe_when_no_session():
     assert result["ok"] is True
 
 
+def test_inspect_ui_scene_full_unloads_on_get_ui_failure():
+    """Sends unload even when get_ui fails, to leave the editor plugin clean."""
+    server = _MockServer(16005, [
+        {"ok": True},                          # load_scene
+        {"ok": False, "error": "timed out"},   # get_ui
+        {"ok": True},                          # unload
+    ])
+    bridge = EditorBridge()
+    bridge.EDITOR_PORT = 16005
+    result = bridge.inspect_ui_scene_full("scenes/hud.tscn", depth=1)
+    assert result["ok"] is False
+    assert "timed out" in result["error"]
+    assert [r["cmd"] for r in server.received] == ["load_scene", "get_ui", "unload"]
+
+
 # ── inspect_ui_scene tests ─────────────────────────────────────────────────────
 
 import server as srv
