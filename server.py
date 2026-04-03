@@ -93,6 +93,37 @@ def scaffold_tests() -> str:
         if changed:
             project_godot.write_text(content, encoding="utf-8")
 
+    # Install UI verification addon files
+    addon_src = Path(__file__).parent / "scaffold" / "addons" / "godot_mcp"
+    addon_dst = Path(project) / "addons" / "godot_mcp"
+    addon_dst.mkdir(parents=True, exist_ok=True)
+    for fname in ("plugin.cfg", "plugin.gd", "remote_control.gd"):
+        src = addon_src / fname
+        dst = addon_dst / fname
+        if src.exists() and not dst.exists():
+            shutil.copy(src, dst)
+            created.append(f"addons/godot_mcp/{fname}")
+
+    # Create screenshots directory
+    screenshots_dir = Path(project) / "tests" / "ui_screenshots"
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+    gitkeep = screenshots_dir / ".gitkeep"
+    if not gitkeep.exists():
+        gitkeep.touch()
+        created.append("tests/ui_screenshots/.gitkeep")
+
+    # Register RemoteControl autoload
+    if project_godot.exists():
+        content = project_godot.read_text(encoding="utf-8")
+        if "GodotMCPRemoteControl" not in content:
+            autoload_line = 'GodotMCPRemoteControl="*res://addons/godot_mcp/remote_control.gd"'
+            if "[autoload]" in content:
+                content = content.replace("[autoload]", f"[autoload]\n{autoload_line}", 1)
+            else:
+                content += f"\n[autoload]\n{autoload_line}\n"
+            project_godot.write_text(content, encoding="utf-8")
+            created.append("project.godot (GodotMCPRemoteControl autoload)")
+
     if not created:
         return "Scaffold already up to date — no files created."
     return "Created:\n" + "\n".join(f"  {f}" for f in created)
@@ -109,6 +140,16 @@ def check_scaffold() -> str:
     for rel in _SCAFFOLD_FILES:
         if not (Path(project) / rel).exists():
             missing.append(rel)
+
+    # Check UI verification addon files
+    addon_files = [
+        Path(project) / "addons" / "godot_mcp" / "plugin.cfg",
+        Path(project) / "addons" / "godot_mcp" / "plugin.gd",
+        Path(project) / "addons" / "godot_mcp" / "remote_control.gd",
+    ]
+    for f in addon_files:
+        if not f.exists():
+            missing.append(str(f.relative_to(project)))
 
     if missing:
         return f"Status: missing\nMissing files:\n" + "\n".join(f"  {f}" for f in missing)
