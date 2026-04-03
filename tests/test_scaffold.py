@@ -86,6 +86,22 @@ def test_scaffold_tests_registers_remote_control_autoload(tmp_path, monkeypatch)
     assert "GodotMCPRemoteControl" in content
 
 
+def test_scaffold_tests_enables_editor_plugin(tmp_path, monkeypatch):
+    """scaffold_tests() adds godot_mcp to [editor_plugins] in project.godot."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    (tmp_path / "project.godot").write_text(
+        '[application]\nconfig/name="Test"\n', encoding="utf-8"
+    )
+    srv.scaffold_tests()
+
+    content = (tmp_path / "project.godot").read_text(encoding="utf-8")
+    assert "[editor_plugins]" in content
+    assert "res://addons/godot_mcp/plugin.cfg" in content
+
+
 def test_check_scaffold_detects_missing_addon_files(tmp_path, monkeypatch):
     """check_scaffold() reports missing when addon files are absent."""
     monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))

@@ -113,7 +113,7 @@ def scaffold_tests() -> str:
         gitkeep.touch()
         created.append("tests/ui_screenshots/.gitkeep")
 
-    # Register RemoteControl autoload
+    # Register RemoteControl autoload and enable EditorPlugin
     if project_godot.exists():
         content = project_godot.read_text(encoding="utf-8")
         if "GodotMCPRemoteControl" not in content:
@@ -122,8 +122,24 @@ def scaffold_tests() -> str:
                 content = content.replace("[autoload]", f"[autoload]\n{autoload_line}", 1)
             else:
                 content += f"\n[autoload]\n{autoload_line}\n"
-            project_godot.write_text(content, encoding="utf-8")
             created.append("project.godot (GodotMCPRemoteControl autoload)")
+
+        plugin_cfg = "res://addons/godot_mcp/plugin.cfg"
+        if plugin_cfg not in content:
+            if "[editor_plugins]" in content:
+                # Append to existing PackedStringArray
+                import re
+                def _add_plugin(m: re.Match) -> str:
+                    arr = m.group(0)
+                    if plugin_cfg in arr:
+                        return arr
+                    return arr.replace('PackedStringArray(', f'PackedStringArray("{plugin_cfg}", ')
+                content = re.sub(r'enabled=PackedStringArray\([^)]*\)', _add_plugin, content)
+            else:
+                content += f'\n[editor_plugins]\n\nenabled=PackedStringArray("{plugin_cfg}")\n'
+            created.append("project.godot (godot_mcp plugin enabled)")
+
+        project_godot.write_text(content, encoding="utf-8")
 
     if not created:
         return "Scaffold already up to date — no files created."
