@@ -121,9 +121,156 @@ def check_scaffold() -> str:
     return f"Status: ok\nVersion: {SCAFFOLD_VERSION}"
 
 
-# ── EditorBridge placeholder (filled in Task 1) ────────────────────────────────
+# ── EditorBridge ──────────────────────────────────────────────────────────────
 
-# (EditorBridge class and _bridge singleton will be added here in Task 1)
+class EditorBridge:
+    """Manages TCP connections to the Godot EditorPlugin (:6789) and
+    the in-game RemoteControl autoload (:6790)."""
+
+    EDITOR_PORT: int = 6789
+    REMOTE_PORT: int = 6790
+    CONNECT_TIMEOUT: float = 2.0
+
+    def __init__(self) -> None:
+        self._session_conn: socket.socket | None = None
+        self._session_proc: object | None = None  # subprocess.Popen
+
+    # ── Editor (stateless, per-call connection) ────────────────────────────
+
+    def send_editor_command(self, cmd: str, **params) -> dict:
+        """Open a connection to the EditorPlugin, send one command, return response."""
+        try:
+            with socket.create_connection(
+                ("localhost", self.EDITOR_PORT), timeout=self.CONNECT_TIMEOUT
+            ) as conn:
+                return self._transact(conn, cmd, params)
+        except ConnectionRefusedError:
+            return {
+                "ok": False,
+                "error": "editor bridge not available — is the Godot editor open?",
+            }
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def inspect_ui_scene_full(self, path: str, depth: int) -> dict:
+        """Load scene, capture UI tree, unload — all in one connection."""
+        try:
+            with socket.create_connection(
+                ("localhost", self.EDITOR_PORT), timeout=self.CONNECT_TIMEOUT
+            ) as conn:
+                r = self._transact(conn, "load_scene", {"path": path})
+                if not r["ok"]:
+                    return r
+                r = self._transact(conn, "get_ui", {"depth": depth})
+                if not r["ok"]:
+                    return r
+                tree = r["tree"]
+                self._transact(conn, "unload", {})
+                return {"ok": True, "tree": tree}
+        except ConnectionRefusedError:
+            return {
+                "ok": False,
+                "error": "editor bridge not available — is the Godot editor open?",
+            }
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # ── Session (persistent connection to running game) ────────────────────
+
+    def start_session(
+        self, godot_bin: str, project_path: str, scene_path: str, timeout: int
+    ) -> dict:
+        """Launch game with --mcp flag, wait for RemoteControl to connect."""
+        import subprocess
+
+        args = [godot_bin, "--path", project_path, "--", "--mcp"]
+        if scene_path:
+            args += ["--mcp-scene", scene_path]
+        self._session_proc = subprocess.Popen(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                conn = socket.create_connection(
+                    ("localhost", self.REMOTE_PORT), timeout=1.0
+                )
+                self._session_conn = conn
+                return {"ok": True}
+            except (ConnectionRefusedError, OSError):
+                time.sleep(0.5)
+        self._session_proc.kill()
+        self._session_proc = None
+        return {
+            "ok": False,
+            "error": f"game did not connect within {timeout}s — check for autoload errors",
+        }
+
+    def send_session_command(self, cmd: str, **params) -> dict:
+        """Send a command to the active game session."""
+        if self._session_conn is None:
+            return {
+                "ok": False,
+                "error": "no active UI session — call start_ui_session first",
+            }
+        try:
+            return self._transact(self._session_conn, cmd, params)
+        except OSError:
+            self._session_conn = None
+            return {
+                "ok": False,
+                "error": "session disconnected — call start_ui_session to reconnect",
+            }
+
+    def end_session(self) -> dict:
+        """Send quit to game and close connection."""
+        if self._session_conn is not None:
+            try:
+                self._transact(self._session_conn, "quit", {})
+            except OSError:
+                pass
+            try:
+                self._session_conn.close()
+            except OSError:
+                pass
+            self._session_conn = None
+        if self._session_proc is not None:
+            try:
+                self._session_proc.wait(timeout=5)
+            except Exception:
+                self._session_proc.kill()
+            self._session_proc = None
+        return {"ok": True}
+
+    def screenshot(self, save_path: str, project_path: str) -> dict:
+        """Capture from active game session if running, else from editor plugin."""
+        resolved = save_path or self._default_screenshot_path(project_path)
+        if self._session_conn is not None:
+            return self.send_session_command("screenshot", save_path=resolved)
+        return self.send_editor_command("screenshot", save_path=resolved)
+
+    # ── Shared helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _transact(conn: socket.socket, cmd: str, params: dict) -> dict:
+        msg = json.dumps({"cmd": cmd, **params}) + "\n"
+        conn.sendall(msg.encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                raise OSError("connection closed before response")
+            buf += chunk
+        return json.loads(buf.split(b"\n")[0])
+
+    @staticmethod
+    def _default_screenshot_path(project_path: str) -> str:
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return str(Path(project_path) / "tests" / "ui_screenshots" / f"{ts}.png")
+
+
+_bridge = EditorBridge()
 
 
 # ── Tools (stubs — filled in subsequent tasks) ─────────────────────────────────
