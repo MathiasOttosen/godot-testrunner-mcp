@@ -1,9 +1,15 @@
 [project]
 name = "godot-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP server for Godot 4 projects"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=3.1.1",
 ]
+
+[tool.uv]
+dev-dependencies = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
