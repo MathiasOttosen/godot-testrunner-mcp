@@ -153,3 +153,140 @@ def test_inspect_ui_scene_returns_json_tree(monkeypatch, tmp_path):
     result = srv.inspect_ui_scene("scenes/menu.tscn", depth=2)
     assert json.loads(result) == tree
     srv._bridge.inspect_ui_scene_full.assert_called_once_with("scenes/menu.tscn", 2)
+
+
+# ── Session MCP tool tests ─────────────────────────────────────────────────────
+
+import server as srv
+import importlib
+
+
+def test_start_ui_session_timeout(monkeypatch, tmp_path):
+    """Returns error string when game does not connect within timeout."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.start_session = MagicMock(
+        return_value={"ok": False, "error": "game did not connect within 1s — check for autoload errors"}
+    )
+    result = srv.start_ui_session(timeout=1)
+    assert "game did not connect within" in result
+
+
+def test_start_ui_session_success(monkeypatch, tmp_path):
+    """Returns confirmation string on successful session start."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/usr/bin/true")
+    importlib.reload(srv)
+
+    srv._bridge.start_session = MagicMock(return_value={"ok": True})
+    result = srv.start_ui_session()
+    assert "ready" in result.lower()
+
+
+def test_end_ui_session(monkeypatch, tmp_path):
+    """Calls bridge.end_session() and returns ok string."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.end_session = MagicMock(return_value={"ok": True})
+    result = srv.end_ui_session()
+    srv._bridge.end_session.assert_called_once()
+    assert "ok" in result.lower() or result == "ok"
+
+
+def test_navigate_ui_no_session(monkeypatch, tmp_path):
+    """Returns error string when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.navigate_ui("press_button", {"node_path": "Menu/Start"})
+    assert "no active UI session" in result
+
+
+def test_navigate_ui_change_scene(monkeypatch, tmp_path):
+    """Routes change_scene action to change_scene command."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    result = srv.navigate_ui("change_scene", {"path": "scenes/game.tscn"})
+    srv._bridge.send_session_command.assert_called_once_with(
+        "change_scene", path="scenes/game.tscn"
+    )
+    assert result == "ok"
+
+
+def test_navigate_ui_press_button(monkeypatch, tmp_path):
+    """Routes press_button action to send_input command."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    result = srv.navigate_ui("press_button", {"node_path": "Menu/StartButton"})
+    srv._bridge.send_session_command.assert_called_once_with(
+        "send_input", action="press_button", params={"node_path": "Menu/StartButton"}
+    )
+    assert result == "ok"
+
+
+def test_get_live_ui_no_session(monkeypatch, tmp_path):
+    """Returns error string when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.get_live_ui()
+    assert "no active UI session" in result
+
+
+def test_get_live_ui_returns_json(monkeypatch, tmp_path):
+    """Returns JSON tree from session on success."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    tree = {"name": "GameHUD", "type": "CanvasLayer", "children": []}
+    srv._bridge.send_session_command = MagicMock(
+        return_value={"ok": True, "tree": tree}
+    )
+    srv._bridge._session_conn = MagicMock()
+    result = srv.get_live_ui(depth=2)
+    assert json.loads(result) == tree
+    srv._bridge.send_session_command.assert_called_once_with("get_ui", depth=2)
+
+
+def test_screenshot_ui_routes_to_bridge(monkeypatch, tmp_path):
+    """screenshot_ui delegates to bridge.screenshot."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.screenshot = MagicMock(
+        return_value={"ok": True, "path": "/tmp/shot.png"}
+    )
+    result = srv.screenshot_ui()
+    srv._bridge.screenshot.assert_called_once()
+    assert "/tmp/shot.png" in result
+
+
+def test_screenshot_ui_error(monkeypatch, tmp_path):
+    """Returns error string on screenshot failure."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.screenshot = MagicMock(
+        return_value={"ok": False, "error": "no scene loaded"}
+    )
+    result = srv.screenshot_ui()
+    assert "no scene loaded" in result

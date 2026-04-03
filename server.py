@@ -294,37 +294,76 @@ def inspect_ui_scene(path: str, depth: int = 1) -> str:
 
 @mcp.tool()
 def start_ui_session(scene_path: str = "", timeout: int = 15) -> str:
-    """Launch the Godot game with --mcp flag and open a RemoteControl session.
-    Stub — implemented in Task 4."""
-    raise NotImplementedError("start_ui_session not yet implemented")
+    """Launch the Godot game with the --mcp flag and wait for the RemoteControl autoload
+    to connect on localhost:6790. If scene_path is given (relative to project root),
+    the game navigates to that scene after connecting.
+    Returns confirmation when the session is ready.
+    The Godot editor does NOT need to be open for this tool."""
+    if scene_path:
+        safe = safe_path(scene_path)
+        if safe is None:
+            return "Error: path escapes project root"
+    result = _bridge.start_session(godot_bin(), godot_project(), scene_path, timeout)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "Session ready — call get_live_ui, navigate_ui, or screenshot_ui."
 
 
 @mcp.tool()
 def end_ui_session() -> str:
-    """End the active UI session and quit the game.
-    Stub — implemented in Task 4."""
-    raise NotImplementedError("end_ui_session not yet implemented")
+    """Send quit to the running game and close the RemoteControl connection.
+    Safe to call even if no session is active."""
+    _bridge.end_session()
+    return "ok"
 
 
 @mcp.tool()
 def navigate_ui(action: str, params: dict | None = None) -> str:
     """Send a navigation or input command to the active UI session.
-    Stub — implemented in Task 4."""
-    raise NotImplementedError("navigate_ui not yet implemented")
+    Requires an active session started by start_ui_session.
+
+    action values:
+      'change_scene' — params: {"path": "scenes/gameplay.tscn"}
+      'press_button' — params: {"node_path": "MainMenu/StartButton"}
+      'input_action' — params: {"action": "ui_accept"}
+    """
+    if params is None:
+        params = {}
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    if action == "change_scene":
+        result = _bridge.send_session_command("change_scene", path=params.get("path", ""))
+    else:
+        result = _bridge.send_session_command("send_input", action=action, params=params)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
 
 
 @mcp.tool()
 def get_live_ui(depth: int = 1) -> str:
-    """Return the current UI tree from the active game session.
-    Stub — implemented in Task 4."""
-    raise NotImplementedError("get_live_ui not yet implemented")
+    """Return the current UI node tree from the active game session as JSON.
+    depth controls how many levels of children to include; default 1 = top-level only.
+    Requires an active session started by start_ui_session.
+    Call this after navigate_ui to verify the UI changed as expected."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command("get_ui", depth=depth)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return json.dumps(result["tree"], indent=2)
 
 
 @mcp.tool()
 def screenshot_ui(save_path: str = "") -> str:
-    """Capture the current viewport as a PNG.
-    Stub — implemented in Task 4."""
-    raise NotImplementedError("screenshot_ui not yet implemented")
+    """Capture the current viewport as a PNG and return the absolute path to the saved file.
+    If save_path is empty, saves to tests/ui_screenshots/<timestamp>.png in the project root.
+    Uses the active game session if running; otherwise captures from the editor plugin's SubViewport.
+    Call inspect_ui_scene or start_ui_session first."""
+    result = _bridge.screenshot(save_path, godot_project())
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return result["path"]
 
 
 if __name__ == "__main__":
