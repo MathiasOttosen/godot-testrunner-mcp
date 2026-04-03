@@ -141,8 +141,6 @@ def test_inspect_ui_scene_editor_not_running(monkeypatch, tmp_path):
 
 def test_inspect_ui_scene_returns_json_tree(monkeypatch, tmp_path):
     """Returns JSON string of the UI tree on success."""
-    (tmp_path / "scenes").mkdir()
-    (tmp_path / "scenes" / "menu.tscn").touch()
     monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
     monkeypatch.setenv("GODOT_BIN", "/bin/false")
     import importlib
