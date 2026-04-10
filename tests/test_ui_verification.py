@@ -128,6 +128,33 @@ def test_inspect_ui_scene_full_unloads_on_get_ui_failure():
     assert [r["cmd"] for r in server.received] == ["load_scene", "get_ui", "unload"]
 
 
+def test_send_session_command_sets_socket_timeout():
+    """send_session_command temporarily overrides and restores the socket timeout."""
+    bridge = EditorBridge()
+    conn_mock = MagicMock()
+    bridge._session_conn = conn_mock
+
+    with patch.object(EditorBridge, "_transact", return_value={"ok": True}) as transact:
+        result = bridge.send_session_command("ping", socket_timeout=7.5, value=1)
+
+    assert result == {"ok": True}
+    transact.assert_called_once_with(conn_mock, "ping", {"value": 1})
+    conn_mock.settimeout.assert_any_call(7.5)
+    conn_mock.settimeout.assert_any_call(bridge.CONNECT_TIMEOUT)
+
+
+def test_send_session_command_no_timeout_does_not_call_settimeout():
+    """No settimeout call when socket_timeout is not provided."""
+    bridge = EditorBridge()
+    conn_mock = MagicMock()
+    bridge._session_conn = conn_mock
+
+    with patch.object(EditorBridge, "_transact", return_value={"ok": True}):
+        bridge.send_session_command("ping")
+
+    conn_mock.settimeout.assert_not_called()
+
+
 # ── inspect_ui_scene tests ─────────────────────────────────────────────────────
 
 import server as srv
@@ -280,22 +307,31 @@ def test_get_live_ui_returns_json(monkeypatch, tmp_path):
     srv._bridge.send_session_command.assert_called_once_with("get_ui", depth=2)
 
 
-def test_screenshot_ui_routes_to_bridge(monkeypatch, tmp_path):
-    """screenshot_ui delegates to bridge.screenshot."""
+def test_screenshot_ui_returns_json_with_metadata(monkeypatch, tmp_path):
+    """screenshot_ui returns JSON dict with path, viewport_size, scene, frame."""
     monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
     monkeypatch.setenv("GODOT_BIN", "/bin/false")
     importlib.reload(srv)
 
     srv._bridge.screenshot = MagicMock(
-        return_value={"ok": True, "path": "/tmp/shot.png"}
+        return_value={
+            "ok": True,
+            "path": "/tmp/shot.png",
+            "viewport_size": [1920, 1080],
+            "scene": "res://scenes/game.tscn",
+            "frame": 42,
+        }
     )
     result = srv.screenshot_ui()
-    srv._bridge.screenshot.assert_called_once()
-    assert "/tmp/shot.png" in result
+    data = json.loads(result)
+    assert data["path"] == "/tmp/shot.png"
+    assert data["viewport_size"] == [1920, 1080]
+    assert data["scene"] == "res://scenes/game.tscn"
+    assert data["frame"] == 42
 
 
-def test_screenshot_ui_error(monkeypatch, tmp_path):
-    """Returns error string on screenshot failure."""
+def test_screenshot_ui_error_still_returns_error_string(monkeypatch, tmp_path):
+    """screenshot_ui returns error string (not JSON) on failure."""
     monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
     monkeypatch.setenv("GODOT_BIN", "/bin/false")
     importlib.reload(srv)
@@ -305,3 +341,312 @@ def test_screenshot_ui_error(monkeypatch, tmp_path):
     )
     result = srv.screenshot_ui()
     assert "no scene loaded" in result
+    assert not result.startswith("{")
+
+
+def test_send_key_no_session(monkeypatch, tmp_path):
+    """send_key returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.send_key("Right")
+    assert "no active UI session" in result
+
+
+def test_send_key_sends_correct_command(monkeypatch, tmp_path):
+    """send_key forwards all params to send_key command."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    result = srv.send_key("Right", shift=True)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "send_key", key="Right", pressed=True, shift=True, ctrl=False, alt=False, echo=False
+    )
+    assert result == "ok"
+
+
+def test_send_mouse_sends_correct_command(monkeypatch, tmp_path):
+    """send_mouse forwards x, y to send_mouse_move command."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    result = srv.send_mouse(100.0, 200.0)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "send_mouse_move", x=100.0, y=200.0
+    )
+    assert result == "ok"
+
+
+def test_click_sends_correct_command(monkeypatch, tmp_path):
+    """click forwards x, y, button to click command."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    result = srv.click(50.0, 75.0, button=2)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "click", x=50.0, y=75.0, button=2
+    )
+    assert result == "ok"
+
+
+def test_drag_sends_correct_command(monkeypatch, tmp_path):
+    """drag forwards all params to drag command."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    result = srv.drag(0.0, 0.0, 100.0, 200.0, steps=10)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "drag", from_x=0.0, from_y=0.0, to_x=100.0, to_y=200.0, button=1, steps=10
+    )
+    assert result == "ok"
+
+
+def test_get_node_no_session(monkeypatch, tmp_path):
+    """get_node returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.get_node("Player")
+    assert "no active UI session" in result
+
+
+def test_get_node_success_returns_json(monkeypatch, tmp_path):
+    """get_node returns JSON node data on success."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    node_data = {
+        "name": "Player",
+        "type": "CharacterBody2D",
+        "path": "/root/Player",
+        "position": [100.0, 200.0],
+    }
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True, "node": node_data})
+    srv._bridge._session_conn = MagicMock()
+    result = srv.get_node("Player")
+    assert json.loads(result) == node_data
+    srv._bridge.send_session_command.assert_called_once_with("get_node", node_path="Player")
+
+
+def test_get_node_with_extra_properties(monkeypatch, tmp_path):
+    """get_node passes properties list when provided."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(
+        return_value={"ok": True, "node": {"name": "Player", "health": 100}}
+    )
+    srv._bridge._session_conn = MagicMock()
+    srv.get_node("Player", properties=["health"])
+    srv._bridge.send_session_command.assert_called_once_with(
+        "get_node", node_path="Player", properties=["health"]
+    )
+
+
+def test_find_nodes_no_session(monkeypatch, tmp_path):
+    """find_nodes returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.find_nodes(type="Label")
+    assert "no active UI session" in result
+
+
+def test_find_nodes_returns_json_array(monkeypatch, tmp_path):
+    """find_nodes returns JSON array of {path, type} dicts."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    nodes = [{"path": "/root/HUD/Label", "type": "Label"}]
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True, "nodes": nodes})
+    srv._bridge._session_conn = MagicMock()
+    result = srv.find_nodes(type="Label")
+    assert json.loads(result) == nodes
+    srv._bridge.send_session_command.assert_called_once_with("find_nodes", type="Label")
+
+
+def test_find_nodes_omits_empty_filters(monkeypatch, tmp_path):
+    """find_nodes does not send empty name/type params."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True, "nodes": []})
+    srv._bridge._session_conn = MagicMock()
+    srv.find_nodes(name="Player")
+    call_kwargs = srv._bridge.send_session_command.call_args.kwargs
+    assert "name" in call_kwargs
+    assert "type" not in call_kwargs
+
+
+def test_await_frames_no_session(monkeypatch, tmp_path):
+    """await_frames returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.await_frames(5)
+    assert "no active UI session" in result
+
+
+def test_await_frames_passes_socket_timeout(monkeypatch, tmp_path):
+    """await_frames passes a socket_timeout of at least 10s."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    srv.await_frames(30)
+    call_kwargs = srv._bridge.send_session_command.call_args.kwargs
+    assert "socket_timeout" in call_kwargs
+    assert call_kwargs["socket_timeout"] >= 10.0
+
+
+def test_await_frames_sends_n(monkeypatch, tmp_path):
+    """await_frames sends n to the await_frames command."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    srv.await_frames(10)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "await_frames", socket_timeout=pytest.approx(10.0, abs=1.0), n=10
+    )
+
+
+def test_await_node_property_no_session(monkeypatch, tmp_path):
+    """await_node_property returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.await_node_property("Player", "visible", True)
+    assert "no active UI session" in result
+
+
+def test_await_node_property_sends_correct_params(monkeypatch, tmp_path):
+    """await_node_property sends params and passes socket_timeout."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    srv.await_node_property("Player", "visible", True, timeout=3.0)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "await_node_property",
+        socket_timeout=5.0,
+        node_path="Player",
+        property="visible",
+        value=True,
+        timeout=3.0,
+    )
+
+
+def test_await_signal_no_session(monkeypatch, tmp_path):
+    """await_signal returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.await_signal("Player", "animation_finished")
+    assert "no active UI session" in result
+
+
+def test_await_signal_sends_correct_params(monkeypatch, tmp_path):
+    """await_signal sends params and passes socket_timeout."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    srv.await_signal("Player", "animation_finished", timeout=4.0)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "await_signal",
+        socket_timeout=6.0,
+        node_path="Player",
+        signal="animation_finished",
+        timeout=4.0,
+    )
+
+
+def test_call_node_method_no_session(monkeypatch, tmp_path):
+    """call_node_method returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.call_node_method("Player", "get_health")
+    assert "no active UI session" in result
+
+
+def test_call_node_method_returns_json_result(monkeypatch, tmp_path):
+    """call_node_method returns JSON-encoded return value on success."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True, "result": 42})
+    srv._bridge._session_conn = MagicMock()
+    result = srv.call_node_method("Player", "get_health")
+    assert json.loads(result) == 42
+    srv._bridge.send_session_command.assert_called_once_with(
+        "call_node_method", node_path="Player", method="get_health", args=[]
+    )
+
+
+def test_call_node_method_passes_args(monkeypatch, tmp_path):
+    """call_node_method passes args list to command."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True, "result": None})
+    srv._bridge._session_conn = MagicMock()
+    srv.call_node_method("Player", "take_damage", args=[10])
+    srv._bridge.send_session_command.assert_called_once_with(
+        "call_node_method", node_path="Player", method="take_damage", args=[10]
+    )
+
+
+def test_call_node_method_error_propagates(monkeypatch, tmp_path):
+    """call_node_method returns error string when Godot reports method not found."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(
+        return_value={"ok": False, "error": "method not found: fly"}
+    )
+    srv._bridge._session_conn = MagicMock()
+    result = srv.call_node_method("Player", "fly")
+    assert "method not found" in result

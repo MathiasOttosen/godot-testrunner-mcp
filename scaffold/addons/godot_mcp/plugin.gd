@@ -4,12 +4,15 @@ extends EditorPlugin
 const PORT := 6789
 const READY_FRAMES := 3
 
+const MCPTree = preload("res://addons/godot_mcp/mcp_tree.gd")
+
 var _server: TCPServer
 var _peer: StreamPeerTCP
 var _viewport: SubViewport
 var _scene_root: Node
 var _pending_load_response := false
 var _load_frame_count := 0
+var _loaded_scene_path := ""
 
 
 func _enter_tree() -> void:
@@ -32,7 +35,6 @@ func _exit_tree() -> void:
 
 
 func _process(_delta: float) -> void:
-	# Accept new connection (one at a time)
 	if _server and _server.is_connection_available():
 		if _peer:
 			_peer.disconnect_from_host()
@@ -41,16 +43,14 @@ func _process(_delta: float) -> void:
 	if not (_peer and _peer.get_status() == StreamPeerTCP.STATUS_CONNECTED):
 		return
 
-	# Advance frame counter for pending load_scene response
 	if _pending_load_response:
 		_load_frame_count += 1
 		if _load_frame_count >= READY_FRAMES:
 			_pending_load_response = false
 			_load_frame_count = 0
 			_respond({"ok": true})
-		return  # don't read new commands while waiting
+		return
 
-	# Read incoming data
 	var available := _peer.get_available_bytes()
 	if available <= 0:
 		return
@@ -74,6 +74,10 @@ func _handle_command(raw: String) -> void:
 			_cmd_load_scene(parsed.get("path", ""))
 		"get_ui":
 			_cmd_get_ui(int(parsed.get("depth", 1)))
+		"get_node":
+			_cmd_get_node(parsed)
+		"find_nodes":
+			_cmd_find_nodes(parsed)
 		"screenshot":
 			_cmd_screenshot(parsed.get("save_path", ""))
 		"unload":
@@ -86,6 +90,7 @@ func _handle_command(raw: String) -> void:
 func _cmd_load_scene(path: String) -> void:
 	_unload_scene()
 	var full_path := "res://" + path
+	_loaded_scene_path = full_path
 	var packed = ResourceLoader.load(full_path)
 	if packed == null:
 		_respond({"ok": false, "error": "failed to load scene: " + path})
@@ -99,7 +104,6 @@ func _cmd_load_scene(path: String) -> void:
 	_scene_root = packed.instantiate()
 	_viewport.add_child(_scene_root)
 
-	# Response is deferred — sent after READY_FRAMES ticks in _process
 	_pending_load_response = true
 	_load_frame_count = 0
 
@@ -108,7 +112,40 @@ func _cmd_get_ui(depth: int) -> void:
 	if _scene_root == null:
 		_respond({"ok": false, "error": "no scene loaded — call load_scene first"})
 		return
-	_respond({"ok": true, "tree": _get_ui_tree(_scene_root, depth)})
+	_respond({"ok": true, "tree": MCPTree.get_ui_tree(_scene_root, depth)})
+
+
+func _cmd_get_node(params: Dictionary) -> void:
+	if _scene_root == null:
+		_respond({"ok": false, "error": "no scene loaded — call load_scene first"})
+		return
+	var node_path: String = params.get("node_path", "")
+	var node := _scene_root.get_node_or_null(node_path)
+	if node == null:
+		_respond({"ok": false, "error": "node not found: " + node_path})
+		return
+	var extra: Array = params.get("properties", [])
+	_respond({"ok": true, "node": MCPTree.get_node_data(node, extra)})
+
+
+func _cmd_find_nodes(params: Dictionary) -> void:
+	if _scene_root == null:
+		_respond({"ok": false, "error": "no scene loaded — call load_scene first"})
+		return
+	var name_filter: String = params.get("name", "")
+	var type_filter: String = params.get("type", "")
+	var matches: Array = []
+	_walk_find(_scene_root, name_filter, type_filter, matches)
+	_respond({"ok": true, "nodes": matches})
+
+
+func _walk_find(node: Node, name_filter: String, type_filter: String, out: Array) -> void:
+	var name_ok := name_filter == "" or node.name == name_filter
+	var type_ok := type_filter == "" or node.get_class() == type_filter
+	if name_ok and type_ok:
+		out.append({"path": str(node.get_path()), "type": node.get_class()})
+	for child in node.get_children():
+		_walk_find(child, name_filter, type_filter, out)
 
 
 func _cmd_screenshot(save_path: String) -> void:
@@ -121,7 +158,14 @@ func _cmd_screenshot(save_path: String) -> void:
 	if err != OK:
 		_respond({"ok": false, "error": "failed to save screenshot to: " + path})
 		return
-	_respond({"ok": true, "path": path})
+	var vp_size := _viewport.size
+	_respond({
+		"ok": true,
+		"path": path,
+		"viewport_size": [vp_size.x, vp_size.y],
+		"scene": _loaded_scene_path,
+		"frame": 0,
+	})
 
 
 func _unload_scene() -> void:
@@ -131,33 +175,7 @@ func _unload_scene() -> void:
 	if _viewport:
 		_viewport.queue_free()
 		_viewport = null
-
-
-func _get_ui_tree(node: Node, depth: int) -> Dictionary:
-	var d: Dictionary = {
-		"name": node.name,
-		"type": node.get_class(),
-		"children": [],
-	}
-	if node is CanvasItem:
-		d["visible"] = (node as CanvasItem).visible
-	if node is Control:
-		var c := node as Control
-		d["position"] = [c.position.x, c.position.y]
-		d["size"] = [c.size.x, c.size.y]
-	if node is Label:
-		d["text"] = (node as Label).text
-	elif node is Button:
-		d["text"] = (node as Button).text
-	elif node is LineEdit:
-		d["text"] = (node as LineEdit).text
-	elif node is RichTextLabel:
-		d["text"] = (node as RichTextLabel).text
-	if depth > 0:
-		for child in node.get_children():
-			if child is CanvasItem:
-				d["children"].append(_get_ui_tree(child, depth - 1))
-	return d
+	_loaded_scene_path = ""
 
 
 func _respond(data: Dictionary) -> void:

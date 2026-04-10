@@ -6,6 +6,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
@@ -98,7 +99,7 @@ def scaffold_tests() -> str:
     addon_src = Path(__file__).parent / "scaffold" / "addons" / "godot_mcp"
     addon_dst = Path(project) / "addons" / "godot_mcp"
     addon_dst.mkdir(parents=True, exist_ok=True)
-    for fname in ("plugin.cfg", "plugin.gd", "remote_control.gd"):
+    for fname in ("plugin.cfg", "plugin.gd", "remote_control.gd", "mcp_tree.gd"):
         src = addon_src / fname
         dst = addon_dst / fname
         if src.exists() and not dst.exists():
@@ -163,6 +164,7 @@ def check_scaffold() -> str:
         Path(project) / "addons" / "godot_mcp" / "plugin.cfg",
         Path(project) / "addons" / "godot_mcp" / "plugin.gd",
         Path(project) / "addons" / "godot_mcp" / "remote_control.gd",
+        Path(project) / "addons" / "godot_mcp" / "mcp_tree.gd",
     ]
     for f in addon_files:
         if not f.exists():
@@ -264,7 +266,9 @@ class EditorBridge:
             "error": f"game did not connect within {timeout}s — check for autoload errors",
         }
 
-    def send_session_command(self, cmd: str, **params) -> dict:
+    def send_session_command(
+        self, cmd: str, socket_timeout: float | None = None, **params
+    ) -> dict:
         """Send a command to the active game session."""
         if self._session_conn is None:
             return {
@@ -272,6 +276,8 @@ class EditorBridge:
                 "error": "no active UI session — call start_ui_session first",
             }
         try:
+            if socket_timeout is not None:
+                self._session_conn.settimeout(socket_timeout)
             return self._transact(self._session_conn, cmd, params)
         except OSError:
             self._session_conn = None
@@ -279,6 +285,13 @@ class EditorBridge:
                 "ok": False,
                 "error": "session disconnected — call start_ui_session to reconnect",
             }
+        finally:
+            if socket_timeout is not None:
+                try:
+                    if self._session_conn is not None:
+                        self._session_conn.settimeout(self.CONNECT_TIMEOUT)
+                except OSError:
+                    pass
 
     def end_session(self) -> dict:
         """Send quit to game and close connection."""
@@ -377,6 +390,8 @@ def end_ui_session() -> str:
 @mcp.tool()
 def navigate_ui(action: str, params: dict | None = None) -> str:
     """Send a navigation or input command to the active UI session.
+    Prefer send_key, click, and drag for new code, they are more direct.
+    navigate_ui remains available for change_scene, press_button, and input_action.
     Requires an active session started by start_ui_session.
 
     action values:
@@ -401,8 +416,9 @@ def navigate_ui(action: str, params: dict | None = None) -> str:
 def get_live_ui(depth: int = 1) -> str:
     """Return the current UI node tree from the active game session as JSON.
     depth controls how many levels of children to include; default 1 = top-level only.
-    Requires an active session started by start_ui_session.
-    Call this after navigate_ui to verify the UI changed as expected."""
+    For targeted inspection of a specific node, use get_node instead.
+    To find nodes by name or type, use find_nodes.
+    Requires an active session started by start_ui_session."""
     if _bridge._session_conn is None:
         return "Error: no active UI session — call start_ui_session first"
     result = _bridge.send_session_command("get_ui", depth=depth)
@@ -413,7 +429,9 @@ def get_live_ui(depth: int = 1) -> str:
 
 @mcp.tool()
 def screenshot_ui(save_path: str = "") -> str:
-    """Capture the current viewport as a PNG and return the absolute path to the saved file.
+    """Capture the current viewport as a PNG and return JSON with path and metadata.
+    Metadata fields: path (absolute), viewport_size [w, h], scene (current scene file path),
+    frame (process frame count; 0 for editor captures).
     If save_path is empty, saves to tests/ui_screenshots/<timestamp>.png in the project root.
     Uses the active game session if running; otherwise captures from the editor plugin's SubViewport.
     Call inspect_ui_scene or start_ui_session first."""
@@ -424,7 +442,202 @@ def screenshot_ui(save_path: str = "") -> str:
     result = _bridge.screenshot(save_path, godot_project())
     if not result["ok"]:
         return f"Error: {result['error']}"
-    return result["path"]
+    return json.dumps({k: v for k, v in result.items() if k != "ok"})
+
+
+@mcp.tool()
+def send_key(
+    key: str,
+    pressed: bool = True,
+    shift: bool = False,
+    ctrl: bool = False,
+    alt: bool = False,
+    echo: bool = False,
+) -> str:
+    """Send a keyboard event to the active game session.
+    key is a Godot key name (e.g. 'Right', 'Left', 'Space', 'A', 'Escape').
+    pressed controls key-down (True) vs key-up (False); default is True.
+    shift, ctrl, alt are modifier keys. echo is for held-key repeat events.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command(
+        "send_key", key=key, pressed=pressed, shift=shift, ctrl=ctrl, alt=alt, echo=echo
+    )
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def send_mouse(x: float, y: float) -> str:
+    """Move the mouse cursor to viewport coordinates (x, y) in the active game session.
+    Coordinates are pixels from the top-left of the viewport.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command("send_mouse_move", x=x, y=y)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def click(x: float, y: float, button: int = 1) -> str:
+    """Click at viewport coordinates (x, y) in the active game session.
+    button: 1=left (default), 2=right, 3=middle.
+    Sends mouse_move, button_down, button_up as one atomic operation.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command("click", x=x, y=y, button=button)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def drag(
+    from_x: float,
+    from_y: float,
+    to_x: float,
+    to_y: float,
+    button: int = 1,
+    steps: int = 5,
+) -> str:
+    """Drag from (from_x, from_y) to (to_x, to_y) in the active game session.
+    button: 1=left (default), 2=right, 3=middle.
+    steps controls intermediate mouse move events for the drag path (default 5).
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command(
+        "drag", from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y, button=button, steps=steps
+    )
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def get_node(node_path: str, properties: list[str] | None = None) -> str:
+    """Return data for a single node from the active game session.
+    node_path is relative to the current scene root (e.g. 'Player', 'HUD/HealthBar').
+    properties: optional list of extra property names to include (e.g. ['health', 'speed']).
+    Returns JSON with standard fields plus requested extras.
+    Use get_live_ui for the full scene tree; use get_node when you know the exact node.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    params: dict[str, Any] = {"node_path": node_path}
+    if properties:
+        params["properties"] = properties
+    result = _bridge.send_session_command("get_node", **params)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return json.dumps(result["node"], indent=2)
+
+
+@mcp.tool()
+def find_nodes(name: str = "", type: str = "") -> str:
+    """Search the current scene for nodes matching name and/or type.
+    name: exact match on node.name. Omit to skip name filter.
+    type: exact match on node class string. Omit to skip type filter.
+    Returns JSON array of {path, type} for all matching nodes.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    params: dict[str, str] = {}
+    if name:
+        params["name"] = name
+    if type:
+        params["type"] = type
+    result = _bridge.send_session_command("find_nodes", **params)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return json.dumps(result["nodes"], indent=2)
+
+
+@mcp.tool()
+def await_frames(n: int) -> str:
+    """Wait for n game frames to pass in the active session before returning.
+    Use after send_key, click, or drag to let the game process input before inspecting state.
+    Blocks until Godot confirms n frames have elapsed.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    socket_timeout = max(n / 60.0 + 5.0, 10.0)
+    result = _bridge.send_session_command(
+        "await_frames", socket_timeout=socket_timeout, n=n
+    )
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def await_node_property(
+    node_path: str, property: str, value: Any, timeout: float = 5.0
+) -> str:
+    """Wait until a node's property equals the given value, or until timeout seconds.
+    node_path: path from current scene root.
+    property: property name to watch.
+    value: the expected value to wait for.
+    Returns ok when matched; returns error with the actual value on timeout.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command(
+        "await_node_property",
+        socket_timeout=timeout + 2.0,
+        node_path=node_path,
+        property=property,
+        value=value,
+        timeout=timeout,
+    )
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def await_signal(node_path: str, signal: str, timeout: float = 5.0) -> str:
+    """Wait for a signal to be emitted on a node, or until timeout seconds.
+    node_path: path from current scene root.
+    signal: signal name.
+    Works for signals with 0, 1, or 2 arguments; best-effort for 3+ args.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command(
+        "await_signal",
+        socket_timeout=timeout + 2.0,
+        node_path=node_path,
+        signal=signal,
+        timeout=timeout,
+    )
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def call_node_method(node_path: str, method: str, args: list | None = None) -> str:
+    """Call a method on a node in the active game session and return the result as JSON.
+    node_path: path from current scene root.
+    method: method name.
+    args: optional list of arguments to pass to the method.
+    Non-JSON-serializable return values are converted to strings by the runtime.
+    Use for debugging and verification, prefer send_key/click for normal gameplay interaction.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command(
+        "call_node_method", node_path=node_path, method=method, args=args or []
+    )
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return json.dumps(result["result"], indent=2)
 
 
 if __name__ == "__main__":
