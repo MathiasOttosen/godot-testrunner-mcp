@@ -4,12 +4,13 @@ extends Node
 ## Registered as an autoload by scaffold_tests() — dormant unless --mcp is present.
 
 const PORT := 6790
+const PROTOCOL_VERSION := "1.1"
 const MCPTree = preload("res://addons/godot_mcp/mcp_tree.gd")
 
 var _server: TCPServer
 var _peer: StreamPeerTCP
 
-enum _AwaitState { NONE, FRAMES, NODE_PROP, SIGNAL }
+enum _AwaitState { NONE, FRAMES, STEP_FRAMES, NODE_PROP, SIGNAL }
 
 var _await_state := _AwaitState.NONE
 var _await_frames_left := 0
@@ -17,9 +18,11 @@ var _await_node_path := ""
 var _await_property := ""
 var _await_value = null
 var _await_deadline_ms := 0
+var _await_step_paused := false
 
 
 func _ready() -> void:
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	var args := OS.get_cmdline_user_args()
 	if "--mcp" not in args:
 		return
@@ -35,7 +38,7 @@ func _ready() -> void:
 	var idx := args.find("--mcp-scene")
 	if idx != -1 and idx + 1 < args.size():
 		var scene_path: String = "res://" + args[idx + 1]
-		get_tree().change_scene_to_file.call_deferred(scene_path)
+		_defer_scene_change(scene_path)
 
 
 func _process(_delta: float) -> void:
@@ -72,6 +75,34 @@ func _handle_command(raw: String) -> void:
 		_respond({"ok": false, "error": "invalid JSON"})
 		return
 	match parsed.get("cmd", ""):
+		"ping":
+			_respond({
+				"ok": true,
+				"protocol_version": PROTOCOL_VERSION,
+				"commands": [
+					"ping",
+					"get_ui",
+					"get_node",
+					"find_nodes",
+					"change_scene",
+					"send_input",
+					"send_key",
+					"send_mouse_move",
+					"send_mouse_button",
+					"click",
+					"drag",
+					"await_frames",
+					"step_frames",
+					"await_node_property",
+					"await_signal",
+					"call_node_method",
+					"set_tree_paused",
+					"get_tree_paused",
+					"set_engine_time_scale",
+					"screenshot",
+					"quit",
+				],
+			})
 		"get_ui":
 			var root := get_tree().current_scene
 			if root == null:
@@ -84,8 +115,8 @@ func _handle_command(raw: String) -> void:
 			_cmd_find_nodes(parsed)
 		"change_scene":
 			var path: String = "res://" + parsed.get("path", "")
-			get_tree().change_scene_to_file(path)
-			_respond({"ok": true})
+			_defer_scene_change(path)
+			_respond({"ok": true, "deferred": true})
 		"send_input":
 			_cmd_send_input(parsed)
 		"send_key":
@@ -100,12 +131,20 @@ func _handle_command(raw: String) -> void:
 			_cmd_drag(parsed)
 		"await_frames":
 			_cmd_await_frames(parsed)
+		"step_frames":
+			_cmd_step_frames(parsed)
 		"await_node_property":
 			_cmd_await_node_property(parsed)
 		"await_signal":
 			_cmd_await_signal(parsed)
 		"call_node_method":
 			_cmd_call_node_method(parsed)
+		"set_tree_paused":
+			_cmd_set_tree_paused(parsed)
+		"get_tree_paused":
+			_cmd_get_tree_paused()
+		"set_engine_time_scale":
+			_cmd_set_engine_time_scale(parsed)
 		"screenshot":
 			_cmd_screenshot(parsed.get("save_path", ""))
 		"quit":
@@ -286,6 +325,17 @@ func _cmd_await_frames(params: Dictionary) -> void:
 	_await_state = _AwaitState.FRAMES
 
 
+func _cmd_step_frames(params: Dictionary) -> void:
+	var n := int(params.get("n", 1))
+	if n <= 0:
+		_respond({"ok": true})
+		return
+	_await_step_paused = get_tree().paused
+	get_tree().paused = false
+	_await_frames_left = n
+	_await_state = _AwaitState.STEP_FRAMES
+
+
 func _cmd_await_node_property(params: Dictionary) -> void:
 	_await_node_path = params.get("node_path", "")
 	_await_property = params.get("property", "")
@@ -355,6 +405,12 @@ func _tick_await() -> void:
 			if _await_frames_left <= 0:
 				_await_state = _AwaitState.NONE
 				_respond({"ok": true})
+		_AwaitState.STEP_FRAMES:
+			_await_frames_left -= 1
+			if _await_frames_left <= 0:
+				_await_state = _AwaitState.NONE
+				get_tree().paused = _await_step_paused
+				_respond({"ok": true})
 		_AwaitState.NODE_PROP:
 			var root := get_tree().current_scene
 			if root == null:
@@ -414,6 +470,25 @@ func _cmd_call_node_method(params: Dictionary) -> void:
 	_respond({"ok": true, "result": serializable})
 
 
+func _cmd_set_tree_paused(params: Dictionary) -> void:
+	var paused: bool = bool(params.get("paused", false))
+	get_tree().paused = paused
+	_respond({"ok": true, "paused": get_tree().paused})
+
+
+func _cmd_get_tree_paused() -> void:
+	_respond({"ok": true, "paused": get_tree().paused})
+
+
+func _cmd_set_engine_time_scale(params: Dictionary) -> void:
+	var scale: float = float(params.get("scale", 1.0))
+	if scale < 0.0:
+		_respond({"ok": false, "error": "scale must be >= 0.0"})
+		return
+	Engine.time_scale = scale
+	_respond({"ok": true, "scale": Engine.time_scale})
+
+
 func _cmd_screenshot(save_path: String) -> void:
 	var img := get_viewport().get_texture().get_image()
 	var path := save_path if save_path != "" else _default_screenshot_path()
@@ -432,6 +507,10 @@ func _cmd_screenshot(save_path: String) -> void:
 		"scene": scene_path,
 		"frame": Engine.get_process_frames(),
 	})
+
+
+func _defer_scene_change(path: String) -> void:
+	get_tree().change_scene_to_file.call_deferred(path)
 
 
 func _respond(data: Dictionary) -> void:

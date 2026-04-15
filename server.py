@@ -1,14 +1,20 @@
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from tempfile import gettempdir
 from typing import Any
 
 from fastmcp import FastMCP
+from PIL import Image
 
 mcp = FastMCP("godot-mcp")
 
@@ -39,7 +45,7 @@ def safe_path(relative: str) -> Path | None:
 
 # ── Scaffold ───────────────────────────────────────────────────────────────────
 
-SCAFFOLD_VERSION = "1.0"
+SCAFFOLD_VERSION = "1.1"
 
 _SCAFFOLD_FILES = [
     "tests/base_test.gd",
@@ -113,6 +119,12 @@ def scaffold_tests() -> str:
     if not gitkeep.exists():
         gitkeep.touch()
         created.append("tests/ui_screenshots/.gitkeep")
+    diffs_dir = screenshots_dir / "diffs"
+    diffs_dir.mkdir(parents=True, exist_ok=True)
+    diffs_gitignore = diffs_dir / ".gitignore"
+    if not diffs_gitignore.exists():
+        diffs_gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+        created.append("tests/ui_screenshots/diffs/.gitignore")
 
     # Register RemoteControl autoload and enable EditorPlugin
     if project_godot.exists():
@@ -182,6 +194,50 @@ def check_scaffold() -> str:
     return f"Status: ok\nVersion: {SCAFFOLD_VERSION}"
 
 
+@dataclass
+class _LaunchObservation:
+    command: list[str]
+    fallback_attempted: bool = False
+    safe_log_path: str | None = None
+    exited: bool = False
+    exit_code: int | None = None
+    port_opened: bool = False
+    handshake_ok: bool = False
+    stdout_lines: deque[str] = field(default_factory=lambda: deque(maxlen=80))
+    evidence_lines: list[str] = field(default_factory=list)
+    classification: str | None = None
+    summary: str | None = None
+
+    def relevant_lines(self) -> list[str]:
+        if self.evidence_lines:
+            return self.evidence_lines[-10:]
+        return list(self.stdout_lines)[-10:]
+
+
+class _ProcessCapture:
+    def __init__(self, proc: subprocess.Popen[str]) -> None:
+        self._proc = proc
+        self._lines: deque[str] = deque(maxlen=200)
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        stream = self._proc.stdout
+        if stream is None:
+            return
+        for line in stream:
+            clean = line.rstrip()
+            if not clean:
+                continue
+            with self._lock:
+                self._lines.append(clean)
+
+    def snapshot(self) -> list[str]:
+        with self._lock:
+            return list(self._lines)
+
+
 # ── EditorBridge ──────────────────────────────────────────────────────────────
 
 class EditorBridge:
@@ -191,6 +247,32 @@ class EditorBridge:
     EDITOR_PORT: int = 6789
     REMOTE_PORT: int = 6790
     CONNECT_TIMEOUT: float = 2.0
+    HANDSHAKE_TIMEOUT: float = 2.0
+    EARLY_HEALTH_WINDOW: float = 3.0
+    LOG_FAILURE_PATTERNS: tuple[str, ...] = (
+        "Failed to open 'user://logs/",
+        "RotatedFileLogger::rotate_file()",
+    )
+    TEST_EXIT_PATTERNS: tuple[str, ...] = (
+        "PASS:",
+        "FAIL:",
+        "Test Summary",
+        "All tests passed",
+    )
+    PROJECT_FAILURE_PATTERNS: tuple[str, ...] = (
+        "SCRIPT ERROR:",
+        "GDScript backtrace",
+        "Parser Error:",
+        "Parse Error:",
+    )
+    REQUIRED_REMOTE_COMMANDS: tuple[str, ...] = (
+        "ping",
+        "get_ui",
+        "get_tree_paused",
+        "set_tree_paused",
+        "set_engine_time_scale",
+        "quit",
+    )
 
     def __init__(self) -> None:
         self._session_conn: socket.socket | None = None
@@ -240,31 +322,30 @@ class EditorBridge:
     # ── Session (persistent connection to running game) ────────────────────
 
     def start_session(
-        self, godot_bin: str, project_path: str, scene_path: str, timeout: int
+        self,
+        godot_bin: str,
+        project_path: str,
+        scene_path: str,
+        timeout: int,
+        launch_mode: str = "ui",
     ) -> dict:
-        """Launch game with --mcp flag, wait for RemoteControl to connect."""
-        args = [godot_bin, "--path", project_path, "--", "--mcp"]
-        if scene_path:
-            args += ["--mcp-scene", scene_path]
-        self._session_proc = subprocess.Popen(
-            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                conn = socket.create_connection(
-                    ("localhost", self.REMOTE_PORT), timeout=1.0
-                )
-                self._session_conn = conn
-                return {"ok": True}
-            except (ConnectionRefusedError, OSError):
-                time.sleep(0.5)
-        self._session_proc.kill()
-        self._session_proc = None
-        return {
-            "ok": False,
-            "error": f"game did not connect within {timeout}s — check for autoload errors",
-        }
+        """Launch a Godot runtime session and verify the remote-control handshake."""
+        self.end_session()
+
+        args = self._build_launch_command(godot_bin, project_path, scene_path, launch_mode)
+        result = self._launch_once(args, timeout, fallback_attempted=False)
+        if self._should_retry_with_safe_log(result):
+            fallback_args = self._build_launch_command(
+                godot_bin,
+                project_path,
+                scene_path,
+                launch_mode,
+                safe_log_path=self._safe_log_file_path(project_path),
+            )
+            result = self._launch_once(fallback_args, timeout, fallback_attempted=True)
+            if result["status"] == "ready":
+                result["status"] = "launch_recovered_with_fallback"
+        return result
 
     def send_session_command(
         self, cmd: str, socket_timeout: float | None = None, **params
@@ -322,6 +403,263 @@ class EditorBridge:
 
     # ── Shared helpers ─────────────────────────────────────────────────────
 
+    def _build_launch_command(
+        self,
+        godot_bin: str,
+        project_path: str,
+        scene_path: str,
+        launch_mode: str,
+        safe_log_path: str | None = None,
+    ) -> list[str]:
+        args = [godot_bin, "--path", project_path]
+        if launch_mode in {"headless-mcp", "headless-tests"}:
+            args.append("--headless")
+        if safe_log_path:
+            args += ["--log-file", safe_log_path]
+        if launch_mode in {"ui", "headless-mcp"}:
+            args += ["--", "--mcp"]
+            if scene_path:
+                args += ["--mcp-scene", scene_path]
+        return args
+
+    def _launch_once(self, args: list[str], timeout: int, fallback_attempted: bool) -> dict:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        capture = _ProcessCapture(proc)
+        observation = _LaunchObservation(command=list(args), fallback_attempted=fallback_attempted)
+        safe_log_path = self._extract_log_file_arg(args)
+        if safe_log_path:
+            observation.safe_log_path = safe_log_path
+
+        deadline = time.monotonic() + timeout
+        early_deadline = min(deadline, time.monotonic() + self.EARLY_HEALTH_WINDOW)
+        while time.monotonic() < deadline:
+            self._update_observation(proc, capture, observation)
+            if observation.exited:
+                self._close_session_connection()
+                self._session_proc = None
+                return self._finalize_failed_launch(observation)
+
+            handshake = self._attempt_handshake(proc)
+            if handshake.get("port_opened"):
+                observation.port_opened = True
+            self._update_observation(proc, capture, observation)
+            if handshake["ok"]:
+                observation.handshake_ok = True
+                self._session_proc = proc
+                return self._finalize_ready_launch(observation)
+            self._close_session_connection()
+            if not handshake.get("retryable", False):
+                observation.classification = "project_incompatible"
+                observation.summary = handshake["error"]
+                observation.evidence_lines = [handshake["error"]]
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+                self._session_proc = None
+                return self._finalize_failed_launch(observation, status="launch_failed_project")
+
+            if time.monotonic() < early_deadline:
+                time.sleep(0.1)
+            else:
+                time.sleep(0.2)
+
+        self._update_observation(proc, capture, observation)
+        self._close_session_connection()
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+        self._session_proc = None
+        return self._finalize_failed_launch(
+            observation,
+            status="launch_failed_timeout",
+            summary=f"remote control did not become ready within {timeout}s",
+            classification="timeout",
+        )
+
+    def _attempt_handshake(self, proc: subprocess.Popen[str]) -> dict:
+        try:
+            conn = socket.create_connection(
+                ("localhost", self.REMOTE_PORT), timeout=self.HANDSHAKE_TIMEOUT
+            )
+        except (ConnectionRefusedError, OSError) as exc:
+            return {
+                "ok": False,
+                "retryable": True,
+                "port_opened": False,
+                "error": f"remote control not reachable yet: {exc}",
+            }
+
+        self._session_conn = conn
+        try:
+            result = self._transact(conn, "ping", {})
+        except OSError as exc:
+            return {
+                "ok": False,
+                "retryable": True,
+                "port_opened": True,
+                "error": f"remote control disconnected during ping: {exc}",
+            }
+
+        if not result.get("ok", False):
+            return {
+                "ok": False,
+                "retryable": False,
+                "port_opened": True,
+                "error": str(result.get("error", "ping failed")),
+            }
+
+        advertised = result.get("commands")
+        if isinstance(advertised, list):
+            missing = [cmd for cmd in self.REQUIRED_REMOTE_COMMANDS if cmd not in advertised]
+            if missing:
+                return {
+                    "ok": False,
+                    "retryable": False,
+                    "port_opened": True,
+                    "error": f"remote control missing required commands: {', '.join(missing)}",
+                }
+
+        if proc.poll() is not None:
+            return {
+                "ok": False,
+                "retryable": True,
+                "port_opened": True,
+                "error": "process exited before handshake completed",
+            }
+        return {"ok": True, "port_opened": True, "ping": result}
+
+    def _update_observation(
+        self,
+        proc: subprocess.Popen[str],
+        capture: _ProcessCapture,
+        observation: _LaunchObservation,
+    ) -> None:
+        lines = capture.snapshot()
+        observation.stdout_lines = deque(lines[-80:], maxlen=80)
+        observation.exit_code = proc.poll()
+        observation.exited = observation.exit_code is not None
+        if observation.classification is None:
+            classification = self._classify_output(lines, observation.port_opened)
+            if classification:
+                observation.classification = classification["classification"]
+                observation.summary = classification["summary"]
+                observation.evidence_lines = classification["evidence_lines"]
+
+    def _classify_output(self, lines: list[str], port_opened: bool) -> dict | None:
+        if not lines:
+            return None
+        engine_hits = [line for line in lines if any(pat in line for pat in self.LOG_FAILURE_PATTERNS)]
+        if engine_hits:
+            return {
+                "classification": "engine_startup_failure",
+                "summary": "Godot failed during engine startup before project autoloads became ready.",
+                "evidence_lines": engine_hits[-3:],
+            }
+        project_hits = [line for line in lines if any(pat in line for pat in self.PROJECT_FAILURE_PATTERNS)]
+        if project_hits:
+            return {
+                "classification": "project_script_failure",
+                "summary": "Project startup emitted script errors before the MCP handshake completed.",
+                "evidence_lines": project_hits[-3:],
+            }
+        test_hits = [line for line in lines if any(pat in line for pat in self.TEST_EXIT_PATTERNS)]
+        if test_hits and not port_opened:
+            return {
+                "classification": "test_runner_exit",
+                "summary": "Headless launch appears to have run tests and exited before MCP became available.",
+                "evidence_lines": test_hits[-5:],
+            }
+        return None
+
+    def _should_retry_with_safe_log(self, result: dict) -> bool:
+        if result.get("status") != "launch_failed_engine":
+            return False
+        if result.get("fallback_attempted"):
+            return False
+        joined = "\n".join(result.get("evidence_lines", []) + result.get("last_output_lines", []))
+        return any(pattern in joined for pattern in self.LOG_FAILURE_PATTERNS)
+
+    def _finalize_ready_launch(self, observation: _LaunchObservation) -> dict:
+        return {
+            "ok": True,
+            "status": "ready",
+            "command": observation.command,
+            "process_exited": False,
+            "exit_code": None,
+            "port_opened": True,
+            "fallback_attempted": observation.fallback_attempted,
+            "safe_log_path": observation.safe_log_path,
+        }
+
+    def _finalize_failed_launch(
+        self,
+        observation: _LaunchObservation,
+        status: str | None = None,
+        summary: str | None = None,
+        classification: str | None = None,
+    ) -> dict:
+        effective_classification = classification or observation.classification
+        effective_summary = summary or observation.summary or "Godot session startup failed."
+        effective_status = status or self._status_for_classification(effective_classification)
+        return {
+            "ok": False,
+            "status": effective_status,
+            "command": observation.command,
+            "process_exited": observation.exited,
+            "exit_code": observation.exit_code,
+            "port_opened": observation.port_opened,
+            "fallback_attempted": observation.fallback_attempted,
+            "safe_log_path": observation.safe_log_path,
+            "classification": effective_classification,
+            "summary": effective_summary,
+            "evidence_lines": observation.evidence_lines,
+            "last_output_lines": observation.relevant_lines(),
+        }
+
+    def _status_for_classification(self, classification: str | None) -> str:
+        if classification == "engine_startup_failure":
+            return "launch_failed_engine"
+        if classification == "project_script_failure" or classification == "project_incompatible":
+            return "launch_failed_project"
+        if classification == "test_runner_exit":
+            return "launch_failed_autoload_exit"
+        return "launch_failed_timeout"
+
+    def _safe_log_file_path(self, project_path: str) -> str:
+        project_slug = Path(project_path).name.replace(" ", "-")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        directory = Path(gettempdir()) / "godot-mcp" / project_slug
+        directory.mkdir(parents=True, exist_ok=True)
+        return str(directory / f"{stamp}.log")
+
+    def _extract_log_file_arg(self, args: list[str]) -> str | None:
+        if "--log-file" not in args:
+            return None
+        idx = args.index("--log-file")
+        if idx + 1 >= len(args):
+            return None
+        return args[idx + 1]
+
+    def _close_session_connection(self) -> None:
+        if self._session_conn is None:
+            return
+        try:
+            self._session_conn.close()
+        except OSError:
+            pass
+        self._session_conn = None
+
     @staticmethod
     def _transact(conn: socket.socket, cmd: str, params: dict) -> dict:
         msg = json.dumps({"cmd": cmd, **params}) + "\n"
@@ -341,6 +679,65 @@ class EditorBridge:
 
 
 _bridge = EditorBridge()
+_last_screenshot_path: Path | None = None
+
+
+def _is_valid_baseline_name(name: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", name))
+
+
+def _baseline_path(baseline_name: str) -> Path | None:
+    if not _is_valid_baseline_name(baseline_name):
+        return None
+    safe = safe_path(f"tests/ui_screenshots/{baseline_name}.png")
+    return safe
+
+
+def _diff_image_path(baseline_name: str) -> Path | None:
+    if not _is_valid_baseline_name(baseline_name):
+        return None
+    safe = safe_path(f"tests/ui_screenshots/diffs/{baseline_name}_diff.png")
+    return safe
+
+
+def _pixel_diff(
+    baseline_path: Path, current_path: Path, diff_path: Path, threshold: float
+) -> dict[str, Any]:
+    baseline_image = Image.open(baseline_path).convert("RGBA")
+    current_image = Image.open(current_path).convert("RGBA")
+
+    if baseline_image.size != current_image.size:
+        return {
+            "error": "size_mismatch",
+            "baseline_size": list(baseline_image.size),
+            "current_size": list(current_image.size),
+        }
+
+    width, height = baseline_image.size
+    total_pixels = width * height
+    changed_pixels = 0
+    diff_image = Image.new("RGB", baseline_image.size, (0, 0, 0))
+
+    baseline_pixels = baseline_image.load()
+    current_pixels = current_image.load()
+    diff_pixels = diff_image.load()
+    for y in range(height):
+        for x in range(width):
+            changed = baseline_pixels[x, y] != current_pixels[x, y]
+            if changed:
+                changed_pixels += 1
+                diff_pixels[x, y] = (255, 0, 200)
+
+    diff_path.parent.mkdir(parents=True, exist_ok=True)
+    diff_image.save(diff_path)
+
+    diff_ratio = changed_pixels / total_pixels if total_pixels else 0.0
+    return {
+        "passed": diff_ratio <= threshold,
+        "diff_ratio": diff_ratio,
+        "changed_pixels": changed_pixels,
+        "total_pixels": total_pixels,
+    }
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────────
@@ -363,20 +760,26 @@ def inspect_ui_scene(path: str, depth: int = 1) -> str:
 
 
 @mcp.tool()
-def start_ui_session(scene_path: str = "", timeout: int = 15) -> str:
+def start_ui_session(scene_path: str = "", timeout: int = 15, headless: bool = False) -> str:
     """Launch the Godot game with the --mcp flag and wait for the RemoteControl autoload
-    to connect on localhost:6790. If scene_path is given (relative to project root),
-    the game navigates to that scene after connecting.
-    Returns confirmation when the session is ready.
+    to become responsive on localhost:6790. If scene_path is given (relative to the
+    project root), the game navigates to that scene after connecting.
+    By default this uses a normal UI launch; set headless=true for headless runtime control.
+    Returns structured startup metadata including status and failure classification.
     The Godot editor does NOT need to be open for this tool."""
     if scene_path:
         safe = safe_path(scene_path)
         if safe is None:
             return "Error: path escapes project root"
-    result = _bridge.start_session(godot_bin(), godot_project(), scene_path, timeout)
-    if not result["ok"]:
-        return f"Error: {result['error']}"
-    return "Session ready — call get_live_ui, navigate_ui, or screenshot_ui."
+    launch_mode = "headless-mcp" if headless else "ui"
+    result = _bridge.start_session(
+        godot_bin(),
+        godot_project(),
+        scene_path,
+        timeout,
+        launch_mode=launch_mode,
+    )
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -443,6 +846,96 @@ def screenshot_ui(save_path: str = "") -> str:
     if not result["ok"]:
         return f"Error: {result['error']}"
     return json.dumps({k: v for k, v in result.items() if k != "ok"})
+
+
+@mcp.tool()
+def compare_ui_screenshot(baseline_name: str, threshold: float = 0.02) -> str:
+    """Capture the current viewport and compare it against a named baseline PNG.
+    baseline_name resolves to tests/ui_screenshots/<name>.png inside the Godot project.
+    threshold is the maximum acceptable changed-pixel ratio; default 0.02 = 2%.
+    Always writes a diff image to tests/ui_screenshots/diffs/<name>_diff.png when sizes match.
+    Returns structured JSON for pass/fail, missing baselines, screenshot failures, or size mismatch."""
+    global _last_screenshot_path
+
+    baseline_path = _baseline_path(baseline_name)
+    diff_path = _diff_image_path(baseline_name)
+    if baseline_path is None or diff_path is None:
+        return json.dumps({"error": "invalid_baseline_name", "baseline_name": baseline_name})
+
+    screenshot = _bridge.screenshot("", godot_project())
+    if not screenshot.get("ok", False):
+        return json.dumps(
+            {
+                "error": "screenshot_failed",
+                "baseline_name": baseline_name,
+                "message": str(screenshot.get("error", "unknown screenshot error")),
+            }
+        )
+
+    _last_screenshot_path = Path(str(screenshot["path"])).resolve()
+    if not baseline_path.exists():
+        return json.dumps(
+            {
+                "error": "baseline_not_found",
+                "baseline_name": baseline_name,
+                "baseline_path": str(baseline_path),
+                "current_path": str(_last_screenshot_path),
+            }
+        )
+
+    result = _pixel_diff(baseline_path, _last_screenshot_path, diff_path, threshold)
+    result.update(
+        {
+            "baseline_name": baseline_name,
+            "baseline_path": str(baseline_path),
+            "current_path": str(_last_screenshot_path),
+            "diff_image_path": str(diff_path),
+            "threshold": threshold,
+        }
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def update_baseline(baseline_name: str) -> str:
+    """Promote the most recent compare_ui_screenshot capture to a named baseline PNG.
+    Copies the cached screenshot to tests/ui_screenshots/<name>.png and stages it with git add.
+    Returns structured JSON for success or failure; this tool never commits changes."""
+    baseline_path = _baseline_path(baseline_name)
+    if baseline_path is None:
+        return json.dumps({"error": "invalid_baseline_name", "baseline_name": baseline_name})
+
+    if _last_screenshot_path is None:
+        return json.dumps({"error": "no_recent_screenshot", "baseline_name": baseline_name})
+    if not _last_screenshot_path.exists():
+        return json.dumps(
+            {
+                "error": "recent_screenshot_missing",
+                "baseline_name": baseline_name,
+                "current_path": str(_last_screenshot_path),
+            }
+        )
+
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_last_screenshot_path, baseline_path)
+
+    git_add = subprocess.run(
+        ["git", "add", str(baseline_path)],
+        capture_output=True,
+        text=True,
+        cwd=godot_project(),
+    )
+    if git_add.returncode != 0:
+        return json.dumps(
+            {
+                "error": "git_add_failed",
+                "baseline_name": baseline_name,
+                "path": str(baseline_path),
+                "message": (git_add.stderr or git_add.stdout).strip(),
+            }
+        )
+
+    return json.dumps({"updated": True, "path": str(baseline_path)}, indent=2)
 
 
 @mcp.tool()
@@ -569,6 +1062,57 @@ def await_frames(n: int) -> str:
     socket_timeout = max(n / 60.0 + 5.0, 10.0)
     result = _bridge.send_session_command(
         "await_frames", socket_timeout=socket_timeout, n=n
+    )
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def set_tree_paused(paused: bool) -> str:
+    """Pause or unpause the active game session's SceneTree.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command("set_tree_paused", paused=paused)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def get_tree_paused() -> str:
+    """Return the active game session's paused state as JSON.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command("get_tree_paused")
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return json.dumps({"paused": result["paused"]}, indent=2)
+
+
+@mcp.tool()
+def set_engine_time_scale(scale: float) -> str:
+    """Set Engine.time_scale for the active game session.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command("set_engine_time_scale", scale=scale)
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return "ok"
+
+
+@mcp.tool()
+def step_frames(n: int) -> str:
+    """Advance the active game session by exactly n process frames, then restore pause state.
+    Requires an active session started by start_ui_session."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    socket_timeout = max(n / 60.0 + 5.0, 10.0)
+    result = _bridge.send_session_command(
+        "step_frames", socket_timeout=socket_timeout, n=n
     )
     if not result["ok"]:
         return f"Error: {result['error']}"

@@ -155,6 +155,125 @@ def test_send_session_command_no_timeout_does_not_call_settimeout():
     conn_mock.settimeout.assert_not_called()
 
 
+def test_build_launch_command_defaults_to_ui_mode():
+    bridge = EditorBridge()
+    args = bridge._build_launch_command("/godot", "/project", "scenes/main.tscn", "ui")
+    assert args == [
+        "/godot",
+        "--path",
+        "/project",
+        "--",
+        "--mcp",
+        "--mcp-scene",
+        "scenes/main.tscn",
+    ]
+
+
+def test_build_launch_command_headless_runtime_includes_headless_and_log_path():
+    bridge = EditorBridge()
+    args = bridge._build_launch_command(
+        "/godot",
+        "/project",
+        "",
+        "headless-mcp",
+        safe_log_path="/tmp/godot-mcp/test.log",
+    )
+    assert args == [
+        "/godot",
+        "--path",
+        "/project",
+        "--headless",
+        "--log-file",
+        "/tmp/godot-mcp/test.log",
+        "--",
+        "--mcp",
+    ]
+
+
+def test_classify_output_detects_engine_failure():
+    bridge = EditorBridge()
+    result = bridge._classify_output(
+        ["ERROR: Failed to open 'user://logs/app.log'", "RotatedFileLogger::rotate_file()"],
+        port_opened=False,
+    )
+    assert result is not None
+    assert result["classification"] == "engine_startup_failure"
+
+
+def test_classify_output_detects_test_runner_exit():
+    bridge = EditorBridge()
+    result = bridge._classify_output(
+        ["PASS: smoke_test", "Test Summary: 1 passed, 0 failed"],
+        port_opened=False,
+    )
+    assert result is not None
+    assert result["classification"] == "test_runner_exit"
+
+
+def test_should_retry_with_safe_log_only_for_engine_failure():
+    bridge = EditorBridge()
+    assert bridge._should_retry_with_safe_log(
+        {
+            "status": "launch_failed_engine",
+            "fallback_attempted": False,
+            "evidence_lines": ["RotatedFileLogger::rotate_file()"],
+            "last_output_lines": [],
+        }
+    )
+    assert not bridge._should_retry_with_safe_log(
+        {
+            "status": "launch_failed_project",
+            "fallback_attempted": False,
+            "evidence_lines": ["SCRIPT ERROR:"],
+            "last_output_lines": [],
+        }
+    )
+
+
+def test_attempt_handshake_rejects_missing_required_commands():
+    bridge = EditorBridge()
+    conn_mock = MagicMock()
+    proc = MagicMock()
+    proc.poll.return_value = None
+    with patch("server.socket.create_connection", return_value=conn_mock):
+        with patch.object(
+            EditorBridge,
+            "_transact",
+            return_value={"ok": True, "commands": ["ping", "get_ui", "quit"]},
+        ):
+            result = bridge._attempt_handshake(proc)
+    assert result["ok"] is False
+    assert "missing required commands" in result["error"]
+
+
+def test_start_session_retries_once_with_safe_log_on_engine_failure():
+    bridge = EditorBridge()
+    with patch.object(
+        EditorBridge,
+        "_launch_once",
+        side_effect=[
+            {
+                "ok": False,
+                "status": "launch_failed_engine",
+                "fallback_attempted": False,
+                "evidence_lines": ["RotatedFileLogger::rotate_file()"],
+                "last_output_lines": [],
+            },
+            {
+                "ok": True,
+                "status": "ready",
+                "fallback_attempted": True,
+                "safe_log_path": "/tmp/godot-mcp/project/test.log",
+            },
+        ],
+    ) as launch_once:
+        result = bridge.start_session("/godot", "/project", "", 5)
+
+    assert result["status"] == "launch_recovered_with_fallback"
+    assert launch_once.call_count == 2
+    assert "--log-file" in launch_once.call_args_list[1].args[0]
+
+
 # ── inspect_ui_scene tests ─────────────────────────────────────────────────────
 
 import server as srv
@@ -204,27 +323,74 @@ import importlib
 
 
 def test_start_ui_session_timeout(monkeypatch, tmp_path):
-    """Returns error string when game does not connect within timeout."""
+    """Returns structured timeout metadata when game does not connect."""
     monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
     monkeypatch.setenv("GODOT_BIN", "/bin/false")
     importlib.reload(srv)
 
     srv._bridge.start_session = MagicMock(
-        return_value={"ok": False, "error": "game did not connect within 1s — check for autoload errors"}
+        return_value={
+            "ok": False,
+            "status": "launch_failed_timeout",
+            "summary": "remote control did not become ready within 1s",
+            "command": ["/bin/false"],
+            "process_exited": False,
+            "exit_code": None,
+            "port_opened": False,
+            "fallback_attempted": False,
+            "evidence_lines": [],
+            "last_output_lines": [],
+        }
     )
     result = srv.start_ui_session(timeout=1)
-    assert "game did not connect within" in result
+    data = json.loads(result)
+    assert data["status"] == "launch_failed_timeout"
+    assert "within 1s" in data["summary"]
 
 
 def test_start_ui_session_success(monkeypatch, tmp_path):
-    """Returns confirmation string on successful session start."""
+    """Returns structured ready metadata on successful session start."""
     monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
     monkeypatch.setenv("GODOT_BIN", "/usr/bin/true")
     importlib.reload(srv)
 
-    srv._bridge.start_session = MagicMock(return_value={"ok": True})
+    srv._bridge.start_session = MagicMock(
+        return_value={
+            "ok": True,
+            "status": "ready",
+            "command": ["/usr/bin/true"],
+            "process_exited": False,
+            "exit_code": None,
+            "port_opened": True,
+            "fallback_attempted": False,
+            "safe_log_path": None,
+        }
+    )
     result = srv.start_ui_session()
-    assert "ready" in result.lower()
+    data = json.loads(result)
+    assert data["status"] == "ready"
+    assert data["port_opened"] is True
+
+
+def test_start_ui_session_headless_uses_headless_runtime_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/usr/bin/true")
+    importlib.reload(srv)
+
+    srv._bridge.start_session = MagicMock(
+        return_value={
+            "ok": True,
+            "status": "ready",
+            "command": ["/usr/bin/true"],
+            "process_exited": False,
+            "exit_code": None,
+            "port_opened": True,
+            "fallback_attempted": False,
+            "safe_log_path": None,
+        }
+    )
+    srv.start_ui_session(headless=True)
+    assert srv._bridge.start_session.call_args.kwargs["launch_mode"] == "headless-mcp"
 
 
 def test_end_ui_session(monkeypatch, tmp_path):
@@ -536,6 +702,126 @@ def test_await_frames_sends_n(monkeypatch, tmp_path):
     srv.await_frames(10)
     srv._bridge.send_session_command.assert_called_once_with(
         "await_frames", socket_timeout=pytest.approx(10.0, abs=1.0), n=10
+    )
+
+
+def test_set_tree_paused_no_session(monkeypatch, tmp_path):
+    """set_tree_paused returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.set_tree_paused(True)
+    assert "no active UI session" in result
+
+
+def test_set_tree_paused_sends_command(monkeypatch, tmp_path):
+    """set_tree_paused sends set_tree_paused command with paused param."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(
+        return_value={"ok": True, "paused": True}
+    )
+    srv._bridge._session_conn = MagicMock()
+    result = srv.set_tree_paused(True)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "set_tree_paused", paused=True
+    )
+    assert result == "ok"
+
+
+def test_get_tree_paused_no_session(monkeypatch, tmp_path):
+    """get_tree_paused returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.get_tree_paused()
+    assert "no active UI session" in result
+
+
+def test_get_tree_paused_returns_state(monkeypatch, tmp_path):
+    """get_tree_paused returns JSON with paused field."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(
+        return_value={"ok": True, "paused": False}
+    )
+    srv._bridge._session_conn = MagicMock()
+    result = srv.get_tree_paused()
+    assert json.loads(result) == {"paused": False}
+
+
+def test_set_engine_time_scale_no_session(monkeypatch, tmp_path):
+    """set_engine_time_scale returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.set_engine_time_scale(0.5)
+    assert "no active UI session" in result
+
+
+def test_set_engine_time_scale_sends_command(monkeypatch, tmp_path):
+    """set_engine_time_scale sends set_engine_time_scale command with scale param."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(
+        return_value={"ok": True, "scale": 0.5}
+    )
+    srv._bridge._session_conn = MagicMock()
+    result = srv.set_engine_time_scale(0.5)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "set_engine_time_scale", scale=0.5
+    )
+    assert result == "ok"
+
+
+def test_step_frames_no_session(monkeypatch, tmp_path):
+    """step_frames returns error when no session is active."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge._session_conn = None
+    result = srv.step_frames(5)
+    assert "no active UI session" in result
+
+
+def test_step_frames_passes_socket_timeout(monkeypatch, tmp_path):
+    """step_frames passes a socket_timeout of at least 10s."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    srv.step_frames(30)
+    call_kwargs = srv._bridge.send_session_command.call_args.kwargs
+    assert "socket_timeout" in call_kwargs
+    assert call_kwargs["socket_timeout"] >= 10.0
+
+
+def test_step_frames_sends_n(monkeypatch, tmp_path):
+    """step_frames sends n to the step_frames command."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv._bridge.send_session_command = MagicMock(return_value={"ok": True})
+    srv._bridge._session_conn = MagicMock()
+    srv.step_frames(10)
+    srv._bridge.send_session_command.assert_called_once_with(
+        "step_frames", socket_timeout=pytest.approx(10.0, abs=1.0), n=10
     )
 
 

@@ -1,7 +1,7 @@
 extends Node
 ## Base class for all godot-mcp test suites.
 
-const SCAFFOLD_VERSION = "1.0"
+const SCAFFOLD_VERSION = "1.1"
 
 var _results: Array[Dictionary] = []
 

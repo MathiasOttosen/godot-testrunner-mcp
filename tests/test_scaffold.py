@@ -72,6 +72,19 @@ def test_scaffold_tests_creates_screenshots_dir(tmp_path, monkeypatch):
     assert (tmp_path / "tests" / "ui_screenshots").is_dir()
 
 
+def test_scaffold_tests_creates_diff_gitignore(tmp_path, monkeypatch):
+    """scaffold_tests() creates a gitignore for ephemeral diff images."""
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv.scaffold_tests()
+
+    diff_gitignore = tmp_path / "tests" / "ui_screenshots" / "diffs" / ".gitignore"
+    assert diff_gitignore.exists()
+    assert diff_gitignore.read_text(encoding="utf-8") == "*\n!.gitignore\n"
+
+
 def test_scaffold_tests_registers_remote_control_autoload(tmp_path, monkeypatch):
     """scaffold_tests() adds GodotMCPRemoteControl autoload to project.godot."""
     monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
@@ -111,7 +124,7 @@ def test_check_scaffold_detects_missing_addon_files(tmp_path, monkeypatch):
 
     # Install core scaffold only (no addons)
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "base_test.gd").write_text('const SCAFFOLD_VERSION = "1.0"', encoding="utf-8")
+    (tmp_path / "tests" / "base_test.gd").write_text('const SCAFFOLD_VERSION = "1.1"', encoding="utf-8")
     (tmp_path / "tests" / "test_runner.gd").touch()
     (tmp_path / "tests" / "smoke").mkdir()
     (tmp_path / "tests" / "smoke" / "smoke_runner.gd").touch()
@@ -131,6 +144,19 @@ def test_scaffold_tests_creates_mcp_tree(tmp_path, monkeypatch):
     assert (tmp_path / "addons" / "godot_mcp" / "mcp_tree.gd").exists()
 
 
+def test_scaffolded_remote_control_advertises_ping_and_deferred_scene_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    srv.scaffold_tests()
+
+    content = (tmp_path / "addons" / "godot_mcp" / "remote_control.gd").read_text(encoding="utf-8")
+    assert '"ping":' in content
+    assert "change_scene_to_file.call_deferred" in content
+    assert 'PROCESS_MODE_ALWAYS' in content
+
+
 def test_check_scaffold_detects_missing_mcp_tree(tmp_path, monkeypatch):
     """check_scaffold() reports missing when mcp_tree.gd is absent."""
     monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
@@ -141,7 +167,7 @@ def test_check_scaffold_detects_missing_mcp_tree(tmp_path, monkeypatch):
     addon_dir.mkdir(parents=True)
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "base_test.gd").write_text(
-        'const SCAFFOLD_VERSION = "1.0"', encoding="utf-8"
+        'const SCAFFOLD_VERSION = "1.1"', encoding="utf-8"
     )
     (tmp_path / "tests" / "test_runner.gd").touch()
     (tmp_path / "tests" / "smoke").mkdir()
