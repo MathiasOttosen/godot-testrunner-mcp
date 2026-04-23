@@ -177,3 +177,46 @@ def test_check_scaffold_detects_missing_mcp_tree(tmp_path, monkeypatch):
 
     result = srv.check_scaffold()
     assert "mcp_tree.gd" in result or "missing" in result.lower()
+
+
+def test_check_scaffold_detects_outdated_addon_protocol(tmp_path, monkeypatch):
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    addon_dir = tmp_path / "addons" / "godot_mcp"
+    addon_dir.mkdir(parents=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "base_test.gd").write_text(
+        'const SCAFFOLD_VERSION = "1.1"', encoding="utf-8"
+    )
+    (tmp_path / "tests" / "test_runner.gd").touch()
+    (tmp_path / "tests" / "smoke").mkdir()
+    (tmp_path / "tests" / "smoke" / "smoke_runner.gd").touch()
+    (addon_dir / "plugin.cfg").touch()
+    (addon_dir / "plugin.gd").touch()
+    (addon_dir / "remote_control.gd").write_text('const PROTOCOL_VERSION := "1.1"', encoding="utf-8")
+    (addon_dir / "mcp_tree.gd").write_text("class_name MCPTree\n", encoding="utf-8")
+
+    result = srv.check_scaffold()
+
+    assert "outdated" in result.lower()
+    assert "addon protocol" in result.lower()
+
+
+def test_scaffold_tests_refreshes_outdated_mcp_addon_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("GODOT_PROJECT", str(tmp_path))
+    monkeypatch.setenv("GODOT_BIN", "/bin/false")
+    importlib.reload(srv)
+
+    addon_dir = tmp_path / "addons" / "godot_mcp"
+    addon_dir.mkdir(parents=True)
+    (addon_dir / "remote_control.gd").write_text('const PROTOCOL_VERSION := "1.1"', encoding="utf-8")
+    (addon_dir / "mcp_tree.gd").write_text("class_name MCPTree\n", encoding="utf-8")
+
+    srv.scaffold_tests()
+
+    assert 'const PROTOCOL_VERSION := "1.2"' in (addon_dir / "remote_control.gd").read_text(
+        encoding="utf-8"
+    )
+    assert "script_path" in (addon_dir / "mcp_tree.gd").read_text(encoding="utf-8")

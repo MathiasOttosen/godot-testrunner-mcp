@@ -8,6 +8,9 @@ static func get_ui_tree(node: Node, depth: int) -> Dictionary:
 		"path": str(node.get_path()),
 		"children": [],
 	}
+	var script := node.get_script()
+	if script != null and script.resource_path != "":
+		data["script_path"] = script.resource_path
 	if node is CanvasItem:
 		data["visible"] = (node as CanvasItem).visible
 	if node is Control:
@@ -44,17 +47,26 @@ static func get_ui_tree(node: Node, depth: int) -> Dictionary:
 	return data
 
 
-static func get_node_data(node: Node, extra_properties: Array) -> Dictionary:
-	var data := get_ui_tree(node, 0)
-	data.erase("children")
+static func get_node_data(
+	node: Node,
+	extra_properties: Array,
+	include_children: bool = false,
+	depth: int = 1
+) -> Dictionary:
+	var data := get_ui_tree(node, depth if include_children else 0)
+	if not include_children:
+		data.erase("children")
 	var known_props: Dictionary = {}
+	var property_errors: Dictionary = {}
 	for prop in node.get_property_list():
 		known_props[prop["name"]] = true
 	for prop in extra_properties:
 		if prop in known_props:
 			data[prop] = _json_safe(node.get(prop))
 		else:
-			data[prop] = "<error: property not found>"
+			property_errors[prop] = "property not found"
+	if not property_errors.is_empty():
+		data["property_errors"] = property_errors
 	return data
 
 

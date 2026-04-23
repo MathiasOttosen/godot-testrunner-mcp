@@ -46,12 +46,24 @@ def safe_path(relative: str) -> Path | None:
 # ── Scaffold ───────────────────────────────────────────────────────────────────
 
 SCAFFOLD_VERSION = "1.1"
+ADDON_PROTOCOL_VERSION = "1.2"
 
 _SCAFFOLD_FILES = [
     "tests/base_test.gd",
     "tests/test_runner.gd",
     "tests/smoke/smoke_runner.gd",
 ]
+
+
+def _addon_file_outdated(path: Path, fname: str) -> bool:
+    if not path.exists():
+        return False
+    content = path.read_text(encoding="utf-8")
+    if fname == "remote_control.gd":
+        return f'PROTOCOL_VERSION := "{ADDON_PROTOCOL_VERSION}"' not in content
+    if fname == "mcp_tree.gd":
+        return "script_path" not in content or "property_errors" not in content
+    return False
 
 
 @mcp.tool()
@@ -108,7 +120,7 @@ def scaffold_tests() -> str:
     for fname in ("plugin.cfg", "plugin.gd", "remote_control.gd", "mcp_tree.gd"):
         src = addon_src / fname
         dst = addon_dst / fname
-        if src.exists() and not dst.exists():
+        if src.exists() and (not dst.exists() or _addon_file_outdated(dst, fname)):
             shutil.copy(src, dst)
             created.append(f"addons/godot_mcp/{fname}")
 
@@ -190,6 +202,20 @@ def check_scaffold() -> str:
     content = base_test.read_text(encoding="utf-8")
     if f'SCAFFOLD_VERSION = "{SCAFFOLD_VERSION}"' not in content:
         return f"Status: outdated\nExpected version: {SCAFFOLD_VERSION}"
+
+    remote_control = Path(project) / "addons" / "godot_mcp" / "remote_control.gd"
+    mcp_tree = Path(project) / "addons" / "godot_mcp" / "mcp_tree.gd"
+    outdated_addons: list[str] = []
+    if _addon_file_outdated(remote_control, "remote_control.gd"):
+        outdated_addons.append("addons/godot_mcp/remote_control.gd")
+    if _addon_file_outdated(mcp_tree, "mcp_tree.gd"):
+        outdated_addons.append("addons/godot_mcp/mcp_tree.gd")
+    if outdated_addons:
+        return (
+            f"Status: outdated\nExpected addon protocol: {ADDON_PROTOCOL_VERSION}\n"
+            + "Outdated files:\n"
+            + "\n".join(f"  {f}" for f in outdated_addons)
+        )
 
     return f"Status: ok\nVersion: {SCAFFOLD_VERSION}"
 
@@ -277,6 +303,7 @@ class EditorBridge:
     def __init__(self) -> None:
         self._session_conn: socket.socket | None = None
         self._session_proc: subprocess.Popen | None = None
+        self._last_launch_result: dict | None = None
 
     # ── Editor (stateless, per-call connection) ────────────────────────────
 
@@ -591,7 +618,7 @@ class EditorBridge:
         return any(pattern in joined for pattern in self.LOG_FAILURE_PATTERNS)
 
     def _finalize_ready_launch(self, observation: _LaunchObservation) -> dict:
-        return {
+        result = {
             "ok": True,
             "status": "ready",
             "command": observation.command,
@@ -601,6 +628,8 @@ class EditorBridge:
             "fallback_attempted": observation.fallback_attempted,
             "safe_log_path": observation.safe_log_path,
         }
+        self._last_launch_result = result
+        return result
 
     def _finalize_failed_launch(
         self,
@@ -612,7 +641,7 @@ class EditorBridge:
         effective_classification = classification or observation.classification
         effective_summary = summary or observation.summary or "Godot session startup failed."
         effective_status = status or self._status_for_classification(effective_classification)
-        return {
+        result = {
             "ok": False,
             "status": effective_status,
             "command": observation.command,
@@ -626,6 +655,8 @@ class EditorBridge:
             "evidence_lines": observation.evidence_lines,
             "last_output_lines": observation.relevant_lines(),
         }
+        self._last_launch_result = result
+        return result
 
     def _status_for_classification(self, classification: str | None) -> str:
         if classification == "engine_startup_failure":
@@ -700,6 +731,143 @@ def _diff_image_path(baseline_name: str) -> Path | None:
     return safe
 
 
+def _port_accepting(port: int, timeout: float = 0.2) -> bool:
+    try:
+        with socket.create_connection(("localhost", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _scaffold_status_from_check(result: str) -> str:
+    first_line = result.splitlines()[0] if result else ""
+    if first_line.startswith("Status: "):
+        return first_line.removeprefix("Status: ").strip()
+    if "already up to date" in result.lower():
+        return "ok"
+    return "unknown"
+
+
+def _project_preflight() -> dict[str, Any]:
+    project_path = godot_project()
+    godot_path = godot_bin()
+    project_root = Path(project_path)
+    godot_binary = Path(godot_path)
+    project_exists = project_root.exists()
+    project_godot_exists = (project_root / "project.godot").exists()
+    godot_bin_exists = godot_binary.exists()
+    warnings: list[str] = []
+
+    if not project_exists:
+        warnings.append("project path does not exist")
+    if not project_godot_exists:
+        warnings.append("project.godot not found")
+    if not godot_bin_exists:
+        warnings.append("GODOT_BIN does not point to an existing file")
+
+    scaffold_status = "unknown"
+    if project_exists:
+        try:
+            scaffold_status = _scaffold_status_from_check(check_scaffold())
+        except Exception as exc:
+            scaffold_status = "error"
+            warnings.append(f"could not check scaffold: {exc}")
+
+    editor_bridge_available = _port_accepting(EditorBridge.EDITOR_PORT)
+    remote_port_busy = _port_accepting(EditorBridge.REMOTE_PORT)
+    if remote_port_busy:
+        warnings.append(
+            f"remote control port {EditorBridge.REMOTE_PORT} is already accepting connections"
+        )
+
+    if not project_exists or not project_godot_exists or not godot_bin_exists:
+        recommended_path = "fix_environment"
+    elif scaffold_status != "ok":
+        recommended_path = "scaffold_tests"
+    elif editor_bridge_available:
+        recommended_path = "editor_bridge_or_runtime_session"
+    else:
+        recommended_path = "runtime_session"
+
+    return {
+        "project_path": project_path,
+        "project_exists": project_exists,
+        "project_godot_exists": project_godot_exists,
+        "godot_bin": godot_path,
+        "godot_bin_exists": godot_bin_exists,
+        "scaffold_status": scaffold_status,
+        "editor_bridge_available": editor_bridge_available,
+        "remote_port_busy": remote_port_busy,
+        "recommended_path": recommended_path,
+        "warnings": warnings,
+    }
+
+
+def _load_ui_critical_scripts(project_path: str) -> tuple[dict[str, str], list[str]]:
+    metadata_path = Path(project_path) / ".Codex" / "ui_critical_scripts.json"
+    if not metadata_path.exists():
+        return {}, ["ui critical metadata not found"]
+    try:
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {}, [f"could not parse ui critical metadata: {exc}"]
+    scripts = raw.get("scripts", {})
+    if not isinstance(scripts, dict):
+        return {}, ["ui critical metadata has no scripts object"]
+    return {str(path): str(reason) for path, reason in scripts.items()}, []
+
+
+def _changed_files_from_git(project_path: str) -> tuple[list[str], list[str]]:
+    result = subprocess.run(
+        ["git", "diff", "--name-only"],
+        capture_output=True,
+        text=True,
+        cwd=project_path,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "unknown error").strip()
+        return [], [f"could not inspect git diff: {message}"]
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()], []
+
+
+def _baseline_hint_for_path(path: str) -> str | None:
+    stem = Path(path).stem
+    if not stem:
+        return None
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", stem)
+
+
+def _verification_item(path: str, ui_critical: dict[str, str]) -> dict[str, Any]:
+    reason = ui_critical.get(path, "")
+    tools: list[str] = []
+    visual_required = False
+
+    if path in ui_critical:
+        visual_required = True
+        tools.extend(["capture_scene", "compare_ui_screenshot"])
+    elif path.endswith(".tscn"):
+        visual_required = True
+        tools.extend(["inspect_ui_scene", "capture_scene"])
+        reason = "scene file changes affect rendered structure or runtime scene composition"
+    elif path.startswith("tests/") and path.endswith(".gd"):
+        tools.append("targeted_godot_tests")
+        reason = "test file changes should be validated with the affected Godot test suite"
+    else:
+        tools.append("targeted_godot_tests")
+        reason = "not listed as UI-critical; start with focused tests or state inspection"
+
+    item: dict[str, Any] = {
+        "path": path,
+        "visual_validation_required": visual_required,
+        "recommended_tools": tools,
+        "reason": reason,
+    }
+    baseline_hint = _baseline_hint_for_path(path)
+    if visual_required and baseline_hint:
+        item["baseline_hint"] = baseline_hint
+    return item
+
+
 def _pixel_diff(
     baseline_path: Path, current_path: Path, diff_path: Path, threshold: float
 ) -> dict[str, Any]:
@@ -743,6 +911,139 @@ def _pixel_diff(
 # ── Tools ──────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
+def preflight_project() -> str:
+    """Return project, scaffold, editor bridge, and runtime port diagnostics as JSON.
+    This tool never launches Godot; use it before choosing editor inspection, runtime
+    capture, or scaffold installation."""
+    return json.dumps(_project_preflight(), indent=2)
+
+
+@mcp.tool()
+def capture_scene(
+    scene_path: str,
+    save_path: str = "",
+    settle_frames: int = 3,
+    timeout: int = 15,
+    headless: bool = False,
+) -> str:
+    """Launch a short runtime MCP session, settle frames, capture a screenshot, and quit.
+    Defaults to normal UI mode because some projects auto-run tests and exit in headless mode."""
+    if safe_path(scene_path) is None:
+        return "Error: path escapes project root"
+    if save_path and safe_path(save_path) is None:
+        return "Error: path escapes project root"
+
+    launch_mode = "headless-mcp" if headless else "ui"
+    launch = _bridge.start_session(
+        godot_bin(),
+        godot_project(),
+        scene_path,
+        timeout,
+        launch_mode=launch_mode,
+    )
+    if not launch.get("ok", False):
+        return json.dumps(
+            {
+                "error": "launch_failed",
+                "status": launch.get("status", "launch_failed"),
+                "scene_path": scene_path,
+                "launch": launch,
+            },
+            indent=2,
+        )
+
+    try:
+        frames = max(0, int(settle_frames))
+        if frames:
+            socket_timeout = max(frames / 60.0 + 5.0, 10.0)
+            settled = _bridge.send_session_command(
+                "await_frames", socket_timeout=socket_timeout, n=frames
+            )
+            if not settled.get("ok", False):
+                return json.dumps(
+                    {
+                        "error": "settle_failed",
+                        "status": "settle_failed",
+                        "scene_path": scene_path,
+                        "message": str(settled.get("error", "unknown settle error")),
+                        "launch": launch,
+                    },
+                    indent=2,
+                )
+
+        screenshot = _bridge.screenshot(save_path, godot_project())
+        if not screenshot.get("ok", False):
+            return json.dumps(
+                {
+                    "error": "screenshot_failed",
+                    "status": "screenshot_failed",
+                    "scene_path": scene_path,
+                    "message": str(screenshot.get("error", "unknown screenshot error")),
+                    "launch": launch,
+                },
+                indent=2,
+            )
+
+        return json.dumps(
+            {
+                "status": "captured",
+                "scene_path": scene_path,
+                "screenshot_path": screenshot.get("path"),
+                "viewport_size": screenshot.get("viewport_size"),
+                "scene": screenshot.get("scene"),
+                "frame": screenshot.get("frame"),
+                "launch": launch,
+                "warnings": [],
+            },
+            indent=2,
+        )
+    finally:
+        _bridge.end_session()
+
+
+@mcp.tool()
+def plan_verification(changed_files: list[str] | None = None) -> str:
+    """Recommend verification steps for changed project files.
+    Uses optional .Codex/ui_critical_scripts.json metadata when present."""
+    project_path = godot_project()
+    warnings: list[str] = []
+    ui_critical, metadata_warnings = _load_ui_critical_scripts(project_path)
+    warnings.extend(metadata_warnings)
+
+    files = changed_files
+    if files is None:
+        files, git_warnings = _changed_files_from_git(project_path)
+        warnings.extend(git_warnings)
+
+    result = {
+        "project_path": project_path,
+        "warnings": warnings,
+        "recommended_sequence": [
+            "preflight_project",
+            "targeted_godot_tests",
+            "inspect_ui_scene_or_capture_scene",
+            "compare_ui_screenshot_if_baseline_exists",
+        ],
+        "files": [_verification_item(path, ui_critical) for path in files],
+    }
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_session_status() -> str:
+    """Return active runtime-session state and the most recent launch result."""
+    proc = _bridge._session_proc
+    process_running = bool(proc is not None and proc.poll() is None)
+    return json.dumps(
+        {
+            "session_active": _bridge._session_conn is not None,
+            "process_running": process_running,
+            "last_launch": _bridge._last_launch_result,
+        },
+        indent=2,
+    )
+
+@mcp.tool()
 def inspect_ui_scene(path: str, depth: int = 1) -> str:
     """Load a Godot scene into the editor's SubViewport and return its UI node tree as JSON.
     path is relative to the project root (e.g. 'scenes/hud.tscn').
@@ -772,6 +1073,7 @@ def start_ui_session(scene_path: str = "", timeout: int = 15, headless: bool = F
         if safe is None:
             return "Error: path escapes project root"
     launch_mode = "headless-mcp" if headless else "ui"
+    started_at = time.monotonic()
     result = _bridge.start_session(
         godot_bin(),
         godot_project(),
@@ -779,6 +1081,7 @@ def start_ui_session(scene_path: str = "", timeout: int = 15, headless: bool = F
         timeout,
         launch_mode=launch_mode,
     )
+    result["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
     return json.dumps(result, indent=2)
 
 
@@ -1032,23 +1335,48 @@ def get_node(node_path: str, properties: list[str] | None = None) -> str:
 
 
 @mcp.tool()
-def find_nodes(name: str = "", type: str = "") -> str:
+def find_nodes(name: str = "", type: str = "", contains: bool = False) -> str:
     """Search the current scene for nodes matching name and/or type.
     name: exact match on node.name. Omit to skip name filter.
+    contains: when true, name is matched as a substring instead of an exact match.
     type: exact match on node class string. Omit to skip type filter.
     Returns JSON array of {path, type} for all matching nodes.
     Requires an active session started by start_ui_session."""
     if _bridge._session_conn is None:
         return "Error: no active UI session — call start_ui_session first"
-    params: dict[str, str] = {}
+    params: dict[str, str | bool] = {}
     if name:
         params["name"] = name
     if type:
         params["type"] = type
+    if contains:
+        params["contains"] = True
     result = _bridge.send_session_command("find_nodes", **params)
     if not result["ok"]:
         return f"Error: {result['error']}"
     return json.dumps(result["nodes"], indent=2)
+
+
+@mcp.tool()
+def get_node_snapshot(
+    node_path: str,
+    properties: list[str] | None = None,
+    include_children: bool = False,
+    depth: int = 1,
+) -> str:
+    """Return targeted node data with optional properties and child tree context."""
+    if _bridge._session_conn is None:
+        return "Error: no active UI session — call start_ui_session first"
+    result = _bridge.send_session_command(
+        "get_node_snapshot",
+        node_path=node_path,
+        properties=properties or [],
+        include_children=include_children,
+        depth=depth,
+    )
+    if not result["ok"]:
+        return f"Error: {result['error']}"
+    return json.dumps(result["node"], indent=2)
 
 
 @mcp.tool()

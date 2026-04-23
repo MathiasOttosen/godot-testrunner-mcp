@@ -4,7 +4,7 @@ extends Node
 ## Registered as an autoload by scaffold_tests() — dormant unless --mcp is present.
 
 const PORT := 6790
-const PROTOCOL_VERSION := "1.1"
+const PROTOCOL_VERSION := "1.2"
 const MCPTree = preload("res://addons/godot_mcp/mcp_tree.gd")
 
 var _server: TCPServer
@@ -83,6 +83,7 @@ func _handle_command(raw: String) -> void:
 					"ping",
 					"get_ui",
 					"get_node",
+					"get_node_snapshot",
 					"find_nodes",
 					"change_scene",
 					"send_input",
@@ -111,6 +112,8 @@ func _handle_command(raw: String) -> void:
 				_respond({"ok": true, "tree": MCPTree.get_ui_tree(root, int(parsed.get("depth", 1)))})
 		"get_node":
 			_cmd_get_node(parsed)
+		"get_node_snapshot":
+			_cmd_get_node_snapshot(parsed)
 		"find_nodes":
 			_cmd_find_nodes(parsed)
 		"change_scene":
@@ -295,6 +298,22 @@ func _cmd_get_node(params: Dictionary) -> void:
 	_respond({"ok": true, "node": MCPTree.get_node_data(node, extra)})
 
 
+func _cmd_get_node_snapshot(params: Dictionary) -> void:
+	var root := get_tree().current_scene
+	if root == null:
+		_respond({"ok": false, "error": "no current scene"})
+		return
+	var node_path: String = params.get("node_path", "")
+	var node := root.get_node_or_null(node_path)
+	if node == null:
+		_respond({"ok": false, "error": "node not found: " + node_path})
+		return
+	var extra: Array = params.get("properties", [])
+	var include_children := bool(params.get("include_children", false))
+	var depth := int(params.get("depth", 1))
+	_respond({"ok": true, "node": MCPTree.get_node_data(node, extra, include_children, depth)})
+
+
 func _cmd_find_nodes(params: Dictionary) -> void:
 	var root := get_tree().current_scene
 	if root == null:
@@ -302,18 +321,27 @@ func _cmd_find_nodes(params: Dictionary) -> void:
 		return
 	var name_filter: String = params.get("name", "")
 	var type_filter: String = params.get("type", "")
+	var contains := bool(params.get("contains", false))
 	var matches: Array = []
-	_walk_find(root, name_filter, type_filter, matches)
+	_walk_find(root, name_filter, type_filter, contains, matches)
 	_respond({"ok": true, "nodes": matches})
 
 
-func _walk_find(node: Node, name_filter: String, type_filter: String, out: Array) -> void:
+func _walk_find(
+	node: Node,
+	name_filter: String,
+	type_filter: String,
+	contains: bool,
+	out: Array
+) -> void:
 	var name_ok := name_filter == "" or node.name == name_filter
+	if contains and name_filter != "":
+		name_ok = node.name.contains(name_filter)
 	var type_ok := type_filter == "" or node.get_class() == type_filter
 	if name_ok and type_ok:
 		out.append({"path": str(node.get_path()), "type": node.get_class()})
 	for child in node.get_children():
-		_walk_find(child, name_filter, type_filter, out)
+		_walk_find(child, name_filter, type_filter, contains, out)
 
 
 func _cmd_await_frames(params: Dictionary) -> void:
