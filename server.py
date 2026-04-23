@@ -32,8 +32,26 @@ def godot_bin() -> str:
     return _require_env("GODOT_BIN")
 
 
-def godot_project() -> str:
+def _nearest_godot_project(start: Path | None = None) -> Path | None:
+    current = (start or Path.cwd()).resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / "project.godot").exists():
+            return candidate
+    return None
+
+
+def _configured_project_path() -> str:
     return _require_env("GODOT_PROJECT")
+
+
+def godot_project() -> str:
+    configured = Path(_configured_project_path()).expanduser().resolve()
+    if configured != Path("/") and (configured / "project.godot").exists():
+        return str(configured)
+    inferred = _nearest_godot_project()
+    if inferred is not None:
+        return str(inferred)
+    return str(configured)
 
 
 def safe_path(relative: str) -> Path | None:
@@ -749,6 +767,7 @@ def _scaffold_status_from_check(result: str) -> str:
 
 
 def _project_preflight() -> dict[str, Any]:
+    configured_project_path = _configured_project_path()
     project_path = godot_project()
     godot_path = godot_bin()
     project_root = Path(project_path)
@@ -764,6 +783,10 @@ def _project_preflight() -> dict[str, Any]:
         warnings.append("project.godot not found")
     if not godot_bin_exists:
         warnings.append("GODOT_BIN does not point to an existing file")
+    if str(Path(configured_project_path).expanduser().resolve()) != project_path:
+        warnings.append(
+            "GODOT_PROJECT resolved from cwd because configured value was not a Godot project"
+        )
 
     scaffold_status = "unknown"
     if project_exists:
@@ -791,6 +814,7 @@ def _project_preflight() -> dict[str, Any]:
 
     return {
         "project_path": project_path,
+        "configured_project_path": configured_project_path,
         "project_exists": project_exists,
         "project_godot_exists": project_godot_exists,
         "godot_bin": godot_path,

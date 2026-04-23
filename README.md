@@ -21,11 +21,14 @@ The key lesson from recent Godot development sessions is to separate structural/
 Returns JSON diagnostics without launching Godot:
 
 - Project path and `project.godot` presence
+- Configured project path when it differs from the resolved project path
 - `GODOT_BIN` presence
 - Scaffold status
 - Editor bridge availability on port `6789`
 - Remote-control port status on port `6790`
 - Recommended next path
+
+If `GODOT_PROJECT` is unset, points at `/`, or points at a directory without `project.godot`, godot-mcp searches upward from the MCP process working directory for the nearest `project.godot`. This lets agents launched from a Godot project recover from a bad inherited `GODOT_PROJECT=/` setting.
 
 Recommended paths:
 

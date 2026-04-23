@@ -77,3 +77,18 @@ def test_project_preflight_never_launches_godot(tmp_path, monkeypatch):
     result = json.loads(server.preflight_project())
 
     assert result["recommended_path"] in {"scaffold_tests", "fix_environment", "runtime_session"}
+
+
+def test_preflight_inferrs_project_from_cwd_when_env_points_at_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("GODOT_PROJECT", "/")
+    monkeypatch.setenv("GODOT_BIN", "/usr/bin/false")
+    monkeypatch.setattr(server, "_port_accepting", lambda port, timeout=0.2: False, raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "project.godot").write_text('[application]\nconfig/name="Test"\n', encoding="utf-8")
+
+    result = json.loads(server.preflight_project())
+
+    assert result["project_path"] == str(tmp_path)
+    assert result["configured_project_path"] == "/"
+    assert result["project_godot_exists"] is True
+    assert "GODOT_PROJECT resolved from cwd because configured value was not a Godot project" in result["warnings"]

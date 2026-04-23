@@ -21,8 +21,6 @@ mcp/
 └── README.md          # setup steps for yourself later
 ```
 
-The `mcp/` folder lives inside the Godot project root at `/Users/kognido/game_dev/the_pattern/mcp/`.
-
 ---
 
 ## Environment Setup
