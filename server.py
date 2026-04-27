@@ -766,6 +766,95 @@ def _scaffold_status_from_check(result: str) -> str:
     return "unknown"
 
 
+def _parse_project_godot(project_path: str) -> dict[str, Any]:
+    """Parse project.godot and return autoloads + viewport/window settings."""
+    result: dict[str, Any] = {"autoloads": {}, "viewport": {}, "has_errors": False}
+    godot_path = Path(project_path) / "project.godot"
+    if not godot_path.exists():
+        result["has_errors"] = True
+        return result
+    try:
+        content = godot_path.read_text(encoding="utf-8")
+        current_section = ""
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                current_section = line[1:-1].strip().lower()
+                continue
+            if current_section == "autoload" and "=" in line:
+                key, val = line.split("=", 1)
+                result["autoloads"][key.strip()] = val.strip().strip('"')
+            if current_section == "display" and "=" in line:
+                key, val = line.split("=", 1)
+                result["viewport"][key.strip()] = val.strip()
+    except Exception:
+        result["has_errors"] = True
+    return result
+
+
+def _check_codebase_map_drift(project_path: str,
+                              godot_autoloads: dict[str,
+                                                     str]) -> list[str]:
+    """Compare codebase_map.md autoload table against project.godot autoloads."""
+    drift_warnings: list[str] = []
+    map_path = Path(project_path) / "docs" / "codebase_map.md"
+    if not map_path.exists():
+        drift_warnings.append("docs/codebase_map.md not found — cannot check drift")
+        return drift_warnings
+
+    try:
+        content = map_path.read_text(encoding="utf-8")
+        # Extract the autoloads table section
+        in_autoloads = False
+        documented: dict[str, str] = {}
+        for line in content.splitlines():
+            if line.strip().startswith("## Autoloads"):
+                in_autoloads = True
+                continue
+            if in_autoloads:
+                if line.strip().startswith("## "):
+                    break
+                if "|" in line and line.strip().startswith("|"):
+                    parts = [p.strip() for p in line.split("|")]
+                    if len(parts) >= 3 and parts[1] not in ("Name", "Script", "",
+                                                           "-") and "-" not in parts[
+                                1].strip("` "):
+                        # Strip markdown backticks, trailing annotations, trailing whitespace
+                        name_raw = parts[1].strip("` ")
+                        script_raw = parts[2].strip("` ")
+                        if script_raw.endswith("`"):
+                            script_raw = script_raw[:-1].strip()
+                        # Remove trailing annotations like "(headless only)"
+                        script_raw = script_raw.split("(")[0].strip()
+                        if name_raw and script_raw:
+                            documented[name_raw] = script_raw
+
+        # Compare: documented but missing from project.godot
+        for name, script in documented.items():
+            godot_path = godot_autoloads.get(name)
+            if godot_path is None:
+                drift_warnings.append(
+                    f"DRIFT: autoload '{name}' ({script}) in codebase_map.md but NOT in project.godot"
+                )
+
+        # Compare: in project.godot but undocumented in codebase_map.md
+        godot_names = set(godot_autoloads.keys())
+        map_names = set(documented.keys())
+        undocumented = godot_names - map_names
+        # Filter out MCP-infrastructure autoloads (noise)
+        mcp_autoloads = {"GodotMCPRemoteControl", "GodotMCPSmokeRunner", "GodotMCPTestRunner"}
+        for name in sorted(undocumented):
+            if name not in mcp_autoloads:
+                drift_warnings.append(
+                    f"DRIFT: autoload '{name}' in project.godot but NOT documented in codebase_map.md"
+                )
+
+    except Exception as exc:
+        drift_warnings.append(f"could not read codebase_map.md: {exc}")
+
+    return drift_warnings
+
+
 def _project_preflight() -> dict[str, Any]:
     configured_project_path = _configured_project_path()
     project_path = godot_project()
@@ -802,6 +891,13 @@ def _project_preflight() -> dict[str, Any]:
         warnings.append(
             f"remote control port {EditorBridge.REMOTE_PORT} is already accepting connections"
         )
+
+    # ── Drift detection ───────────────────────────────────────────────────────
+    if project_godot_exists:
+        godot_cfg = _parse_project_godot(project_path)
+        if not godot_cfg["has_errors"]:
+            warnings.extend(
+                _check_codebase_map_drift(project_path, godot_cfg["autoloads"]))
 
     if not project_exists or not project_godot_exists or not godot_bin_exists:
         recommended_path = "fix_environment"
